@@ -781,6 +781,11 @@ pub struct App {
 }
 
 impl App {
+    /// The actual per-App arena, rather than the fallback thread-local arena.
+    pub fn element_arena_memory_bytes(&self) -> usize {
+        self.element_arena.borrow().capacity()
+    }
+
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,

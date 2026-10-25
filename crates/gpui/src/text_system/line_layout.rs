@@ -556,6 +556,15 @@ impl LineLayoutCache {
             .truncate(index.wrapped_lines_by_hash_index);
     }
 
+    pub(crate) fn memory_stats(&self) -> [usize; 4] {
+        let prev = self.previous_frame.lock();
+        let curr = self.current_frame.read();
+        [prev.lines.len() + curr.lines.len(),
+         prev.wrapped_lines.len() + curr.wrapped_lines.len(),
+         prev.lines_by_hash.len() + curr.lines_by_hash.len(),
+         prev.wrapped_lines_by_hash.len() + curr.wrapped_lines_by_hash.len()]
+    }
+
     pub fn finish_frame(&self) {
         let mut prev_frame = self.previous_frame.lock();
         let mut curr_frame = self.current_frame.write();

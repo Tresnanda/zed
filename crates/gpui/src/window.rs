@@ -4944,6 +4944,10 @@ impl Window {
     }
 
     /// Retained frame arena allocation capacity, after its last safe reset.
+    pub fn text_layout_memory_stats(&self) -> [usize; 4] {
+        self.text_system().layout_memory_stats()
+    }
+
     pub fn element_arena_memory_bytes(&self) -> usize {
         ELEMENT_ARENA.with(|arena| arena.borrow().capacity())
     }

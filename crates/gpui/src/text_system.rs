@@ -661,6 +661,11 @@ impl WindowTextSystem {
         Ok(lines)
     }
 
+    /// Current and prior frame shaped-layout counts.
+    pub fn layout_memory_stats(&self) -> [usize; 4] {
+        self.line_layout_cache.memory_stats()
+    }
+
     pub(crate) fn finish_frame(&self) {
         self.line_layout_cache.finish_frame()
     }
