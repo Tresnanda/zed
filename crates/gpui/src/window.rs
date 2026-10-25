@@ -1161,6 +1161,7 @@ const KEYBOARD_MODALITY_MOUSE_SLOP: Pixels = px(8.);
 /// Holds the state for a specific window.
 pub struct Window {
     kybern_motion_frame_epoch: u64,
+    pub(crate) kybern_prepaint_rollback_epoch: u64,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
@@ -1865,6 +1866,7 @@ impl Window {
 
         Ok(Window {
             kybern_motion_frame_epoch: 0,
+            kybern_prepaint_rollback_epoch: 0,
             handle,
             invalidator,
             removed: false,
@@ -3841,6 +3843,7 @@ impl Window {
         let index = self.prepaint_index();
         let result = f(self);
         if result.is_err() {
+            self.kybern_prepaint_rollback_epoch = self.kybern_prepaint_rollback_epoch.wrapping_add(1);
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
             self.next_frame
                 .tooltip_requests

@@ -292,6 +292,9 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    prepaint_frame: u64,
+    paint_frame: Option<u64>,
+    rollback_epoch: u64,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -394,6 +397,9 @@ impl<V: View> Element for ViewElement<V> {
                         let text_style = window.text_style();
 
                         if let Some(mut element_state) = element_state
+                            && element_state.prepaint_frame.wrapping_add(1) == window.kybern_motion_frame_epoch()
+                            && element_state.paint_frame == Some(element_state.prepaint_frame)
+                            && element_state.rollback_epoch == window.kybern_prepaint_rollback_epoch
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
@@ -407,6 +413,7 @@ impl<V: View> Element for ViewElement<V> {
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.prepaint_frame = window.kybern_motion_frame_epoch();
 
                             return (None, element_state);
                         }
@@ -438,6 +445,9 @@ impl<V: View> Element for ViewElement<V> {
                         (
                             Some(element),
                             ViewElementState {
+                                prepaint_frame: window.kybern_motion_frame_epoch(),
+                                paint_frame: None,
+                                rollback_epoch: window.kybern_prepaint_rollback_epoch,
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -496,6 +506,7 @@ impl<V: View> Element for ViewElement<V> {
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            element_state.paint_frame = Some(window.kybern_motion_frame_epoch());
 
                             ((), element_state)
                         },
