@@ -148,6 +148,7 @@ pub(crate) struct A11y {
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
+    subtree_last_update: Option<TreeUpdate>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
@@ -176,6 +177,7 @@ impl A11y {
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
+            subtree_last_update: None,
             action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
@@ -287,6 +289,7 @@ impl A11y {
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
         let update = self.nodes.finalize();
+        self.subtree_last_update = Some(update.clone());
         self.debug.capture(
             &update,
             self.nodes.focus,
@@ -895,3 +898,5 @@ mod tests {
         assert_eq!(update.focus, a);
     }
 }
+
+include!("../subtree_a11y.rs");

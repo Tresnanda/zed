@@ -832,6 +832,7 @@ pub struct Hitbox {
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
     identity: Option<GlobalElementId>,
+    subtree_geometry: Option<SubtreeGeometry>,
 }
 
 impl Hitbox {
@@ -1184,6 +1185,9 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     rounded_clip_pool: RoundedClipPool,
+    subtree_tags: Vec<(u64, Point<Pixels>)>,
+    subtree_a11y: std::collections::HashMap<accesskit::NodeId,SubtreeGeometry>,
+    subtree_masks: Vec<SubtreeMask>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1874,6 +1878,9 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             rounded_clip_pool: Default::default(),
+            subtree_tags: Vec::new(),
+            subtree_a11y: Default::default(),
+            subtree_masks: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3254,6 +3261,7 @@ impl Window {
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
+            self.subtree_a11y.clear();
             self.a11y.begin_frame();
         }
 
@@ -3736,10 +3744,12 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
+            self.push_subtree_mask(mask);
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
+            self.pop_subtree_mask();
             result
         } else {
             f(self)
@@ -4131,7 +4141,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let clipped_bounds = if self.subtree_tags.is_empty(){bounds.intersect(&content_mask.bounds)}else{bounds};
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -4307,6 +4317,7 @@ impl Window {
             border_style: quad.border_style,
         };
 
+        if !self.subtree_tags.is_empty() {self.next_frame.scene.insert_primitive(quad);return;}
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
             return;
@@ -5056,6 +5067,7 @@ impl Window {
             content_mask,
             behavior,
             identity,
+            subtree_geometry: self.subtree_geometry(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -8082,3 +8094,5 @@ thread_local! {
 }
 
 include!("rounded_clip.rs");
+
+include!("subtree_geometry.rs");

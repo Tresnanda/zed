@@ -937,6 +937,10 @@ impl TextLayout {
             .collect()
     }
 
+    /// Translate retained selection/link geometry alongside a painted subtree.
+    pub fn translate(&self, delta: Point<Pixels>) {
+        if let Some(layout)=self.0.borrow_mut().as_mut() {if let Some(bounds)=layout.bounds.as_mut(){bounds.origin+=delta;}}
+    }
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()

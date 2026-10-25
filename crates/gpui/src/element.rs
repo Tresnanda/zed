@@ -377,6 +377,7 @@ impl<E: Element> Drawable<E> {
                             });
                             self.element.write_a11y_info(&mut node);
                             window.a11y.node_bounds.insert(node_id, bounds);
+                            window.record_subtree_a11y(node_id);
                             pushed_a11y_node = window.a11y.nodes.push(node_id, node);
                             #[cfg(debug_assertions)]
                             if pushed_a11y_node {

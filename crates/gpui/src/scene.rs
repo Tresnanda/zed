@@ -40,6 +40,8 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    pub(crate) active_subtree_geometry: Option<std::sync::Arc<crate::window::SubtreeGeometry>>,
+    pub(crate) subtree_geometries: std::collections::HashMap<usize, std::sync::Arc<crate::window::SubtreeGeometry>>,
     // A tag identifies a passive fixed-geometry leaf, never a scene position.
     // Kept outside GPU structs; shader layouts and primitive ordering are unchanged.
     /// Identity of the last ordinary scene reconstruction.
@@ -73,6 +75,8 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.subtree_geometries.clear();
+        self.active_subtree_geometry = None;
         self.repaint_tags.clear();
         self.repaint_slots.clear();
         self.passive_paint_bounds = None;
@@ -99,6 +103,7 @@ impl Scene {
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
+        if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
@@ -114,7 +119,7 @@ impl Scene {
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
-        if clipped_bounds.is_empty() {
+        if clipped_bounds.is_empty() && self.active_subtree_geometry.is_none() {
             return;
         }
 
@@ -122,7 +127,7 @@ impl Scene {
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(if clipped_bounds.is_empty() { *primitive.bounds() } else { clipped_bounds }));
         // Filtering is an ordering barrier, including inside paint_layer.
         // Offset subsequent natural bounds-tree orders; clamping loses ordering.
         let order = if matches!(&primitive, Primitive::Backdrop(_)) { self.maximum_order + 1 } else { order + self.backdrop_order_offset };
@@ -170,14 +175,17 @@ impl Scene {
                 self.repaint_tags.insert(self.paint_operations.len(), tag);
             }
         }
+        if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        let previous_geometry = self.active_subtree_geometry.clone();
         let previous_tag = self.active_repaint_tag;
         for index in range {
             self.active_repaint_tag = prev_scene.repaint_tags.get(&index).copied();
+            self.active_subtree_geometry = prev_scene.subtree_geometries.get(&index).cloned().or_else(|| previous_geometry.clone());
             let operation = &prev_scene.paint_operations[index];
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -186,6 +194,7 @@ impl Scene {
             }
         }
         self.active_repaint_tag = previous_tag;
+        self.active_subtree_geometry = previous_geometry;
     }
 
     /// Replace only recorded quad fills / monochrome tint, preserving geometry,
@@ -1304,3 +1313,5 @@ impl Scene {
         true
     }
 }
+
+include!("subtree_scene.rs");
