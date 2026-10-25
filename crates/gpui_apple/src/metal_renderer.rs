@@ -139,6 +139,7 @@ pub struct MetalRenderer {
     paint_region_packed: Vec<(i64,i64)>,
     paint_region_base_holes: Vec<metal::MTLScissorRect>,
     backdrop_resources: Option<BackdropResources>,
+    compositor_layers: std::collections::HashMap<(u64, u32), (gpui::CompositorLoop, *mut objc::runtime::Object)>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -382,6 +383,7 @@ impl MetalRenderer {
             paint_region_packed: Vec::new(),
             paint_region_base_holes: Vec::new(),
             backdrop_resources: None,
+            compositor_layers: std::collections::HashMap::new(),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -488,6 +490,21 @@ impl MetalRenderer {
     }
 
     fn draw_with_frame_pool(&mut self, scene: &Scene) {
+        // A changed compositor-loop set commits in the same CA transaction as this Metal frame, so a
+        // leaf never shows twice or not at all while it moves between the scene and its sublayer.
+        if !self.compositor_in_sync(scene) {
+            unsafe { let _: () = msg_send![objc::class!(CATransaction), begin]; let _: () = msg_send![objc::class!(CATransaction), setDisableActions: YES]; }
+            let transaction = self.presents_with_transaction;
+            self.presents_with_transaction = true;
+            if let Some(layer) = self.layer.as_ref() { let mode: bool = unsafe { msg_send![&**layer, presentsWithTransaction] }; if !mode { layer.set_presents_with_transaction(true); } }
+            self.sync_compositor_layers(scene);
+            self.draw_with_frame_pool_inner(scene);
+            unsafe { let _: () = msg_send![objc::class!(CATransaction), commit]; }
+            self.presents_with_transaction = transaction;
+            if let Some(layer) = self.layer.as_ref() { let mode: bool = unsafe { msg_send![&**layer, presentsWithTransaction] }; if mode != transaction { layer.set_presents_with_transaction(transaction); } }
+        } else { self.draw_with_frame_pool_inner(scene); }
+    }
+    fn draw_with_frame_pool_inner(&mut self, scene: &Scene) {
         static REGION_LAYERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *REGION_LAYERS.get_or_init(||std::env::var("KYBERN_REGION_LAYERS").as_deref()==Ok("1")) && (self.has_passive_region_layers() || (Self::passive_region_enabled() && scene.has_native_paint_animation() && scene.paths.is_empty() && scene.backdrops.is_empty() && scene.surfaces.is_empty())) {
             unsafe {let _: ()=msg_send![objc::class!(CATransaction),begin];let _: ()=msg_send![objc::class!(CATransaction),setDisableActions:YES];}
@@ -1892,3 +1909,5 @@ fn gpu_trace_scene(scene: &Scene, viewport: Size<DevicePixels>) {
     let instance_bytes=scene.quads.len()*mem::size_of::<gpui::Quad>()+scene.monochrome_sprites.len()*mem::size_of::<gpui::MonochromeSprite>()+scene.polychrome_sprites.len()*mem::size_of::<gpui::PolychromeSprite>()+scene.shadows.len()*mem::size_of::<gpui::Shadow>()+scene.underlines.len()*mem::size_of::<gpui::Underline>()+scene.surfaces.len()*mem::size_of::<SurfaceBounds>()+scene.rounded_clips.len()*mem::size_of::<gpui::RoundedClip>();
     eprintln!("[gpu-scene] generation={} draws={} backdropDraws={} batches={} quads={} glyphs={} colorSprites={} shadows={} paths={} pathVertices={} backdrops={} roundedNodes={} glyphClipSteps={} glyphClipDepthMax={} roundedGlyphs={} prunedGlyphs={} atlasUploads={} atlasBytes={} atlasEvictions={} instanceBytes={} rasterArea={} viewport={}x{}",scene.paint_generation,draws,2*scene.backdrops.iter().filter(|b|b.opacity>0. && !b.bounds.intersect(&b.content_mask.bounds).is_empty()).count(),scene.batches().count(),scene.quads.len(),scene.monochrome_sprites.len(),scene.polychrome_sprites.len(),scene.shadows.len(),scene.paths.len(),scene.paths.iter().map(|p|p.vertices.len()).sum::<usize>(),scene.backdrops.len(),scene.rounded_clips.len(),clip_steps,clip_depth,clipped,pruned,uploads,bytes,evictions,instance_bytes,raster_area,i32::from(viewport.width),i32::from(viewport.height));
 }
+
+include!("compositor_loops_renderer.rs");

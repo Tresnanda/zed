@@ -1231,6 +1231,7 @@ pub struct Window {
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     paint_animation_scheduled: bool,
+    compositor_stable: std::collections::HashMap<(u64, u32), Bounds<ScaledPixels>>,
     stroke_draws: std::collections::HashMap<u64, std::sync::Arc<crate::scene::StrokeDraw>>,
     stroke_svg_renderer: Option<crate::SvgRenderer>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1928,6 +1929,7 @@ impl Window {
             hovered,
             needs_present,
             paint_animation_scheduled: false,
+            compositor_stable: std::collections::HashMap::new(),
             stroke_draws: Default::default(),
             stroke_svg_renderer: None,
             input_rate_tracker,
@@ -3201,6 +3203,8 @@ impl Window {
         if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
             let message=format!("[kybern-frame] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
         }
+        let compositor = crate::scene::compositor_loops_enabled() && !self.kybern_test_clock_paused();
+        self.rendered_frame.scene.promote_compositor(&mut self.compositor_stable, compositor);
         let animated = self.rendered_frame.scene.animate_tagged();
         let animated = self.rendered_frame.scene.animate_fades() | animated;
         let animated = self.animate_strokes() | animated;
@@ -8225,3 +8229,8 @@ include!("stream_fade_window.rs");
 include!("stroke_draw_window.rs");
 
 include!("hover_reconcile.rs");
+
+impl SubtreeTransformContext {
+    /// Opacity 1 and no blur: what the subtree paints keeps its own alpha (compositor loops).
+    pub(crate) fn kybern_paint_neutral(&self) -> bool { (self.opacity - 1.).abs() < 1e-4 && self.blur == 0. }
+}
