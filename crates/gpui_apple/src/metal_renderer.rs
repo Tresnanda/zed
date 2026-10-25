@@ -1596,11 +1596,19 @@ struct InstanceBindings {
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
-        quads: writer.write(&scene.quads)?,
+        quads: writer.write_iter(scene.quads.iter().map(|value| { let mut value=*value; value.content_mask=gpu_clip_prune(scene,value.content_mask,value.bounds); value }))?,
         shadows: writer.write(&scene.shadows)?,
-        underlines: writer.write(&scene.underlines)?,
-        monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
-        polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
+        underlines: writer.write_iter(scene.underlines.iter().map(|value| { let mut value=*value; value.content_mask=gpu_clip_prune(scene,value.content_mask,value.bounds); value }))?,
+        monochrome_sprites: writer.write_iter(scene.monochrome_sprites.iter().map(|value| {
+            let mut value=*value;
+            // Native pop, SVG rotation and affine scopes retain their original
+            // shader chain. Their transformed raster envelope may exceed bounds.
+            if value.transformation == gpui::TransformationMatrix::unit() {
+                value.content_mask=gpu_clip_prune(scene,value.content_mask,value.bounds);
+            }
+            value
+        }))?,
+        polychrome_sprites: writer.write_iter(scene.polychrome_sprites.iter().map(|value| { let mut value=*value; value.content_mask=gpu_clip_prune(scene,value.content_mask,value.bounds); value }))?,
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
@@ -1841,3 +1849,5 @@ include!("paint_region_present.rs");
 include!("paint_region_cull.rs");
 
 include!("paint_region_atlas.rs");
+
+include!("gpu_clip.rs");
