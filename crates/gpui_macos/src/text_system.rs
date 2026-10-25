@@ -174,6 +174,7 @@ impl PlatformTextSystem for MacTextSystem {
             )?;
 
             let font_id = candidates[ix];
+            let font_id = lock.weight_variation(font_id, font.weight.0);
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -431,7 +432,8 @@ impl MacTextSystemState {
     }
 
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
-        let postscript_name = requested_font.postscript_name();
+        if let Some(font_id) = self.same_face(&requested_font) { return font_id; }
+        let postscript_name = native_font_key(&requested_font);
         if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
             *font_id
         } else {
@@ -604,7 +606,7 @@ impl MacTextSystemState {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
+                        &sized_native_font(run.font_id, font, font_size.into()),
                     );
                 }
                 break_ligature = !break_ligature;
@@ -941,3 +943,5 @@ mod tests {
         assert!(layout.runs.is_empty());
     }
 }
+
+include!("font_weight.rs");
