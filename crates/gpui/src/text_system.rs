@@ -666,6 +666,9 @@ impl WindowTextSystem {
         self.line_layout_cache.memory_stats()
     }
 
+    /// Allocated capacities of the current and previous frame layout tables.
+    pub fn layout_capacity_stats(&self) -> [usize; 8] { self.line_layout_cache.capacity_stats() }
+
     pub(crate) fn finish_frame(&self) {
         self.line_layout_cache.finish_frame()
     }

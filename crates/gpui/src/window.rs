@@ -3088,6 +3088,9 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        let dispatch_nodes = self.rendered_frame.dispatch_tree.len();
+        self.rendered_frame.dispatch_tree.trim_memory(dispatch_nodes);
+        self.next_frame.dispatch_tree.trim_memory(dispatch_nodes);
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -4944,6 +4947,16 @@ impl Window {
     }
 
     /// Retained frame arena allocation capacity, after its last safe reset.
+    /// Live dispatch nodes and the two frames' allocated node-buffer bytes.
+    pub fn dispatch_memory_stats(&self) -> [usize; 3] {
+        [self.rendered_frame.dispatch_tree.len(), self.rendered_frame.dispatch_tree.memory_bytes(), self.next_frame.dispatch_tree.memory_bytes()]
+    }
+
+    /// Current and prior frame shaped-layout counts.
+    /// Allocated capacities of the two frame layout caches.
+    pub fn text_layout_capacity_stats(&self) -> [usize; 8] { self.text_system().layout_capacity_stats() }
+
+    /// Current and prior frame shaped-layout counts.
     pub fn text_layout_memory_stats(&self) -> [usize; 4] {
         self.text_system().layout_memory_stats()
     }

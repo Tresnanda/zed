@@ -32,6 +32,7 @@ mod input;
 mod inspector;
 mod interactive;
 mod key_dispatch;
+mod code_frame;
 mod keymap;
 mod path_builder;
 mod platform;

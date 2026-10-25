@@ -159,6 +159,16 @@ impl DispatchTree {
         self.view_node_ids.clear();
     }
 
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<DispatchNode>()
+    }
+
+    pub(crate) fn trim_memory(&mut self, used_hint: usize) {
+        if let Some(target) = crate::code_frame::target(self.nodes.capacity(), used_hint.max(self.nodes.len())) {
+            if crate::code_frame::enabled() { self.nodes.shrink_to(target); }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }

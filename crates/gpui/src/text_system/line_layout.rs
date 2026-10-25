@@ -476,6 +476,24 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
+impl FrameCache {
+    fn memory_hint(&self) -> [usize; 8] {
+        [self.lines.len(), self.wrapped_lines.len(), self.lines_by_hash.len(), self.wrapped_lines_by_hash.len(),
+         self.used_lines.len(), self.used_wrapped_lines.len(), self.used_lines_by_hash.len(), self.used_wrapped_lines_by_hash.len()]
+    }
+    fn trim_memory(&mut self, hint: [usize; 8]) {
+        macro_rules! trim {
+            ($field:ident, $index:expr) => {
+                if let Some(target) = crate::code_frame::target(self.$field.capacity(), hint[$index].max(self.$field.len())) {
+                    self.$field.shrink_to(target);
+                }
+            }
+        }
+        trim!(lines, 0); trim!(wrapped_lines, 1); trim!(lines_by_hash, 2); trim!(wrapped_lines_by_hash, 3);
+        trim!(used_lines, 4); trim!(used_wrapped_lines, 5); trim!(used_lines_by_hash, 6); trim!(used_wrapped_lines_by_hash, 7);
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
     lines_index: usize,
@@ -556,6 +574,14 @@ impl LineLayoutCache {
             .truncate(index.wrapped_lines_by_hash_index);
     }
 
+    pub(crate) fn capacity_stats(&self) -> [usize; 8] {
+        let prev = self.previous_frame.lock(); let curr = self.current_frame.read();
+        [prev.lines.capacity() + curr.lines.capacity(), prev.wrapped_lines.capacity() + curr.wrapped_lines.capacity(),
+         prev.lines_by_hash.capacity() + curr.lines_by_hash.capacity(), prev.wrapped_lines_by_hash.capacity() + curr.wrapped_lines_by_hash.capacity(),
+         prev.used_lines.capacity() + curr.used_lines.capacity(), prev.used_wrapped_lines.capacity() + curr.used_wrapped_lines.capacity(),
+         prev.used_lines_by_hash.capacity() + curr.used_lines_by_hash.capacity(), prev.used_wrapped_lines_by_hash.capacity() + curr.used_wrapped_lines_by_hash.capacity()]
+    }
+
     pub(crate) fn memory_stats(&self) -> [usize; 4] {
         let prev = self.previous_frame.lock();
         let curr = self.current_frame.read();
@@ -578,6 +604,11 @@ impl LineLayoutCache {
         curr_frame.wrapped_lines_by_hash.clear();
         curr_frame.used_lines_by_hash.clear();
         curr_frame.used_wrapped_lines_by_hash.clear();
+        if crate::code_frame::enabled() {
+            let hint = prev_frame.memory_hint();
+            prev_frame.trim_memory(hint);
+            curr_frame.trim_memory(hint);
+        }
     }
 
     pub fn layout_wrapped_line<Text>(
