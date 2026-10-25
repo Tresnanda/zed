@@ -601,6 +601,14 @@ impl MetalRenderer {
             viewport_size,
         )?;
 
+        static MEMORY_COUNTERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MEMORY_COUNTERS.get_or_init(|| std::env::var("KYBERN_MEMORY_COUNTERS").as_deref() == Ok("1")) {
+            let pool = self.instance_buffer_pool.lock();
+            let texture_bytes = |texture: &Option<metal::Texture>| texture.as_ref().map_or(0, |t| t.width() * t.height() * 4);
+            gpui::record_memory_gpu([self.device.current_allocated_size(), pool.buffer_size as u64,
+                pool.buffers.iter().map(|buffer| buffer.length()).sum(), self.sprite_atlas.allocated_bytes(),
+                texture_bytes(&self.path_intermediate_texture), self.backdrop_resources.as_ref().map_or(0, |r| texture_bytes(&r.scratch))]);
+        }
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let block = ConcreteBlock::new(move |_| {

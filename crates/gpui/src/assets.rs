@@ -9,6 +9,19 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering::SeqCst},
 };
 
+static MEMORY_GPU: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// Diagnostic gauges: Metal allocated bytes, instance target/cached bytes,
+/// atlas textures, path intermediate and backdrop scratch.
+pub fn memory_debug_stats() -> [u64; 6] {
+    let mut values = [0; 6];
+    for (value, gauge) in values.iter_mut().zip(MEMORY_GPU.iter()) { *value = gauge.load(std::sync::atomic::Ordering::Relaxed); }
+    values
+}
+/// Record renderer diagnostics only when KYBERN_MEMORY_COUNTERS is enabled.
+pub fn record_memory_gpu(values: [u64; 6]) {
+    for (gauge, value) in MEMORY_GPU.iter().zip(values) { gauge.store(value, std::sync::atomic::Ordering::Relaxed); }
+}
+
 /// A source of assets for this app to use.
 pub trait AssetSource: 'static + Send + Sync {
     /// Load the given asset from the source path.

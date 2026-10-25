@@ -42,6 +42,12 @@ impl MetalAtlas {
         }
     }
 
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        let lock = self.state.lock();
+        lock.monochrome_textures.textures.iter().chain(lock.polychrome_textures.textures.iter()).filter_map(Option::as_ref)
+            .map(|texture| texture.metal_texture.width() * texture.metal_texture.height() * texture.bytes_per_pixel() as u64).sum()
+    }
+
     pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> metal::Texture {
         self.state.lock().texture(id).metal_texture.clone()
     }

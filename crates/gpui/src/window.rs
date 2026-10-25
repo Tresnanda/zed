@@ -4937,6 +4937,11 @@ impl Window {
         Ok(retained_all_tiles)
     }
 
+    /// Retained frame arena allocation capacity, after its last safe reset.
+    pub fn element_arena_memory_bytes(&self) -> usize {
+        ELEMENT_ARENA.with(|arena| arena.borrow().capacity())
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {
