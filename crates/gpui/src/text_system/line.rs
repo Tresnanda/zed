@@ -542,14 +542,14 @@ fn paint_line(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            layout.font_size * window.text_system().font_scale(run.font_id),
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            layout.font_size * window.text_system().font_scale(run.font_id),
                             color,
                         )?;
                     }

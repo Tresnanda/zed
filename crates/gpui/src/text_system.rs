@@ -59,6 +59,11 @@ pub struct TextSystem {
 }
 
 impl TextSystem {
+    /// Kybern: the size scale of a font (`kszl` feature), 1 for ordinary fonts.
+    pub fn font_scale(&self, font_id: FontId) -> f32 {
+        self.platform_text_system.font_scale(font_id)
+    }
+
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         TextSystem {

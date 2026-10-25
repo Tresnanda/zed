@@ -71,6 +71,10 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// Kybern: FontIds loaded with the `kszl` size feature, and their scale.
+    font_scales: HashMap<FontId, f32>,
+    /// Kybern: every FontId per PostScript name, to map shaped runs back to a scaled id.
+    font_ids_by_postscript_name_all: HashMap<String, Vec<FontId>>,
 }
 
 impl MacTextSystem {
@@ -84,6 +88,8 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            font_scales: HashMap::default(),
+            font_ids_by_postscript_name_all: HashMap::default(),
         }))
     }
 }
@@ -207,6 +213,10 @@ impl PlatformTextSystem for MacTextSystem {
         self.0.write().layout_line(text, font_size, font_runs)
     }
 
+    fn font_scale(&self, font_id: FontId) -> f32 {
+        self.0.read().font_scales.get(&font_id).copied().unwrap_or(1.0)
+    }
+
     fn recommended_rendering_mode(
         &self,
         _font_id: FontId,
@@ -283,6 +293,15 @@ impl MacTextSystemState {
 
         let mut font_ids = SmallVec::new();
         let mut postscript_names_seen = HashSet::default();
+        // Kybern: the `kszl` pseudo feature is a size scale, not an OpenType feature.
+        let scale = features.0.iter().find(|(tag, _)| tag == "kszl").map(|(_, value)| (*value as f32 / 1000.0).clamp(0.25, 4.0));
+        let stripped;
+        let features = if scale.is_some() {
+            stripped = FontFeatures(std::sync::Arc::new(features.0.iter().filter(|(tag, _)| tag != "kszl").cloned().collect()));
+            &stripped
+        } else {
+            features
+        };
         let family = self
             .memory_source
             .select_family_by_name(name)
@@ -373,8 +392,14 @@ impl MacTextSystemState {
             }
             let font_id = FontId(self.fonts.len());
             font_ids.push(font_id);
-            self.font_ids_by_postscript_name
-                .insert(postscript_name.clone(), font_id);
+            if let Some(scale) = scale {
+                self.font_scales.insert(font_id, scale);
+            }
+            self.font_ids_by_postscript_name_all.entry(postscript_name.clone()).or_default().push(font_id);
+            if scale.is_none() || !self.font_ids_by_postscript_name.contains_key(&postscript_name) {
+                self.font_ids_by_postscript_name
+                    .insert(postscript_name.clone(), font_id);
+            }
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
             self.fonts.push(font);
@@ -390,6 +415,19 @@ impl MacTextSystemState {
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
+    }
+
+    /// Kybern: the FontId of a shaped run, matching its point size to a scaled id.
+    fn id_for_scaled_native_font(&mut self, requested_font: CTFont, line_size: Pixels) -> FontId {
+        let ratio = requested_font.pt_size() as f32 / f32::from(line_size).max(0.01);
+        if (ratio - 1.0).abs() > 0.005 {
+            if let Some(ids) = self.font_ids_by_postscript_name_all.get(&requested_font.postscript_name()) {
+                if let Some(id) = ids.iter().find(|id| self.font_scales.get(id).is_some_and(|s| (s - ratio).abs() < 0.01)) {
+                    return *id;
+                }
+            }
+        }
+        self.id_for_native_font(requested_font)
     }
 
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
@@ -550,6 +588,7 @@ impl MacTextSystemState {
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
                 let font = &self.fonts[run.font_id.0];
+                let font_size = font_size * self.font_scales.get(&run.font_id).copied().unwrap_or(1.0);
 
                 let font_metrics = font.metrics();
                 let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
@@ -584,7 +623,7 @@ impl MacTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
+            let font_id = self.id_for_scaled_native_font(font, font_size);
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
