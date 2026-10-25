@@ -1197,6 +1197,7 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    paint_animation_scheduled: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1882,6 +1883,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            paint_animation_scheduled: false,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3117,7 +3119,23 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
+            let message=format!("[kybern-frame] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
+        }
+        let animated = self.rendered_frame.scene.animate_tagged();
         self.platform_window.draw(&self.rendered_frame.scene);
+        if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
+            let message=format!("[kybern-submit] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
+        }
+        if animated && !self.paint_animation_scheduled {
+            self.paint_animation_scheduled = true;
+            self.on_next_frame(|window, _| {
+                window.paint_animation_scheduled = false;
+                window.needs_present.set(true);
+            });
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
