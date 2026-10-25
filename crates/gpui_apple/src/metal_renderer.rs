@@ -131,6 +131,13 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    paint_region_resources: Option<PaintRegionResources>,
+    paint_region_scissor: Option<metal::MTLScissorRect>,
+    paint_region_origin: Option<(i64,i64)>,
+    paint_region_command: Option<metal::CommandBuffer>,
+    paint_region_crops: Vec<metal::MTLScissorRect>,
+    paint_region_packed: Vec<(i64,i64)>,
+    paint_region_base_holes: Vec<metal::MTLScissorRect>,
     backdrop_resources: Option<BackdropResources>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -366,6 +373,13 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            paint_region_resources: None,
+            paint_region_scissor: None,
+            paint_region_origin: None,
+            paint_region_command: None,
+            paint_region_crops: Vec::new(),
+            paint_region_packed: Vec::new(),
+            paint_region_base_holes: Vec::new(),
             backdrop_resources: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -400,6 +414,7 @@ impl MetalRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        self.release_passive_region_target();
         if let Some(layer) = &self.layer {
             let ns_size = NSSize {
                 width: size.width.0 as f64,
@@ -472,6 +487,19 @@ impl MetalRenderer {
     }
 
     fn draw_with_frame_pool(&mut self, scene: &Scene) {
+        static REGION_LAYERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *REGION_LAYERS.get_or_init(||std::env::var("KYBERN_REGION_LAYERS").as_deref()==Ok("1")) && (self.has_passive_region_layers() || (Self::passive_region_enabled() && scene.has_native_paint_animation() && scene.paths.is_empty() && scene.backdrops.is_empty() && scene.surfaces.is_empty())) {
+            unsafe {let _: ()=msg_send![objc::class!(CATransaction),begin];let _: ()=msg_send![objc::class!(CATransaction),setDisableActions:YES];}
+            let transaction=self.presents_with_transaction;
+            self.presents_with_transaction=true;
+            if let Some(layer)=self.layer.as_ref(){let mode:bool=unsafe {msg_send![&**layer,presentsWithTransaction]};if !mode {layer.set_presents_with_transaction(true);}}
+            self.draw_with_region_transaction(scene);
+            unsafe {let _: ()=msg_send![objc::class!(CATransaction),commit];}
+            self.presents_with_transaction=transaction;
+            if let Some(layer)=self.layer.as_ref(){let wanted=transaction||self.has_passive_region_layers();let mode:bool=unsafe {msg_send![&**layer,presentsWithTransaction]};if mode!=wanted {layer.set_presents_with_transaction(wanted);}}
+        } else {self.draw_with_region_transaction(scene);}
+    }
+    fn draw_with_region_transaction(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -486,6 +514,8 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        if self.present_passive_regions(scene, viewport_size) { return; }
+        self.clear_passive_region_layers();
         let drawable_started = std::time::Instant::now();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
@@ -500,14 +530,35 @@ impl MetalRenderer {
         if drawable_started.elapsed().as_millis() > 100 && std::env::var_os("KYBERN_DRAWABLE_TIMES").is_some() {
             eprintln!("[frame-drawable] {:.3} ms transaction={}", drawable_started.elapsed().as_secs_f64()*1000.0, self.presents_with_transaction);
         }
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+        let retained = match self.paint_region_target(scene,viewport_size) {
+            Ok(value) => value,
+            Err(error) => { log::error!("passive region setup: {error:#}"); self.paint_region_scissor=None; None },
+        };
+        let target = retained.as_deref().unwrap_or(drawable.texture());
+        let command_buffer = match self.render_frame(scene, target, viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
+                self.paint_region_scissor = None;
                 log::error!("failed to render: {error:#}");
                 return;
             }
         };
 
+        self.trace_paint_region(&command_buffer, scene, viewport_size, retained.is_some(), if std::env::var("KYBERN_GPU_TRACE_SPLIT").as_deref() == Ok("1") { "scene" } else { "frame" });
+        self.paint_region_scissor = None;
+        if retained.is_some() { self.paint_region_resources.as_mut().unwrap().generation = scene.paint_generation; }
+        let command_buffer = if let Some(target) = retained.as_ref() {
+            if std::env::var("KYBERN_GPU_TRACE_SPLIT").as_deref() == Ok("1") {
+                command_buffer.commit();
+                let copy = self.command_queue.new_command_buffer().to_owned();
+                self.copy_paint_region(&copy, target, drawable.texture(), viewport_size);
+                self.trace_paint_region(&copy, scene, viewport_size, true, "copy");
+                copy
+            } else {
+                self.copy_paint_region(&command_buffer, target, drawable.texture(), viewport_size);
+                command_buffer
+            }
+        } else { command_buffer };
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -765,17 +816,28 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
-        let command_buffer = command_queue.new_command_buffer();
-        let alpha = if self.opaque { 1. } else { 0. };
+        let shared_command=self.paint_region_command.clone();
+        let command_buffer=shared_command.as_deref().unwrap_or_else(||command_queue.new_command_buffer());
+        let alpha = if self.paint_region_origin.is_some() {0.} else if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
             viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+            if self.paint_region_scissor.is_some() && self.paint_region_origin.is_none() { None } else { Some(metal::MTLClearColor::new(0., 0., 0., alpha)) },
         );
 
+
         if let Some(r)=&mut self.backdrop_resources { r.begin_frame(!scene.backdrops.is_empty()); }
+        let damage = self.paint_region_scissor;
+        let regions = self.paint_region_rectangles(scene, viewport_size);
+        let saved_origin=self.paint_region_origin;
+        for (region_index,region) in regions.into_iter().enumerate() {
+            if let Some(origin)=self.paint_region_packed.get(region_index){self.paint_region_origin=Some(*origin); }
+            if let Some((x,y))=self.paint_region_origin {command_encoder.set_viewport(metal::MTLViewport {originX:-(x as f64),originY:-(y as f64),width:i32::from(viewport_size.width) as f64,height:i32::from(viewport_size.height) as f64,znear:0.,zfar:1.});}
+            self.paint_region_scissor = region;
+            if let Some(mut rect) = region { if let Some((x,y))=self.paint_region_origin {rect.x=(rect.x as i64-x).max(0) as u64;rect.y=(rect.y as i64-y).max(0) as u64;} command_encoder.set_scissor_rect(rect); }
+            self.clear_paint_region(command_encoder, alpha as f32);
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Backdrop(index) => {
@@ -849,6 +911,12 @@ impl MetalRenderer {
             }
         }
 
+        }
+        self.paint_region_origin=saved_origin;
+        self.paint_region_scissor = damage;
+        if !self.paint_region_base_holes.is_empty(){
+            self.clear_base_holes(command_encoder);
+        }
         command_encoder.end_encoding();
 
         // Dynamic atlas updates use CPU replacement, so retain the newest
@@ -1744,3 +1812,11 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 }
 
 include!("backdrop_renderer.rs");
+
+include!("paint_region_renderer.rs");
+
+include!("paint_region_present.rs");
+
+include!("paint_region_cull.rs");
+
+include!("paint_region_atlas.rs");

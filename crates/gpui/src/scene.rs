@@ -42,6 +42,12 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     // A tag identifies a passive fixed-geometry leaf, never a scene position.
     // Kept outside GPU structs; shader layouts and primitive ordering are unchanged.
+    /// Identity of the last ordinary scene reconstruction.
+    pub paint_generation: u64,
+    /// Union of passive leaf geometry touched since that reconstruction.
+    pub passive_paint_bounds: Option<Bounds<ScaledPixels>>,
+    /// Separate leaf regions avoid repainting the empty space between loaders.
+    pub passive_paint_regions: std::collections::HashMap<u64, Bounds<ScaledPixels>>,
     repaint_slots: std::collections::HashMap<usize, (u8, usize)>,
     pub(crate) active_repaint_tag: Option<(u64, u8, f32, Option<crate::PaintAnimation>, Hsla)>,
     repaint_tags: std::collections::HashMap<usize, (u64, u8, f32, Option<crate::PaintAnimation>, Hsla)>,
@@ -66,6 +72,8 @@ impl Scene {
         self.paint_operations.clear();
         self.repaint_tags.clear();
         self.repaint_slots.clear();
+        self.passive_paint_bounds = None;
+        self.passive_paint_regions.clear();
         self.active_repaint_tag = None;
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -198,6 +206,12 @@ impl Scene {
         for (&index, &(id, kind, inherited_opacity, _, _)) in &self.repaint_tags {
             let Some(color) = colors.get(&id) else { continue; };
             let color = color.opacity(inherited_opacity);
+            let bounds = match &self.paint_operations[index] {
+                PaintOperation::Primitive(primitive) => primitive.bounds().intersect(&primitive.content_mask().bounds),
+                _ => unreachable!("validated paint primitive"),
+            };
+            self.passive_paint_regions.entry(id).and_modify(|old| *old = old.union(&bounds)).or_insert(bounds);
+            self.passive_paint_bounds = Some(self.passive_paint_bounds.map_or(bounds, |old| old.union(&bounds)));
             match (&mut self.paint_operations[index], kind) {
                 (PaintOperation::Primitive(Primitive::Quad(quad)), 0) => {
                     quad.background = color.into();
@@ -227,11 +241,20 @@ impl Scene {
         true
     }
 
+    /// Whether this scene contains a visible declarative passive-paint loop.
+    pub fn has_native_paint_animation(&self) -> bool {
+        self.repaint_tags.values().any(|(_,_,_,animation,_)| animation.is_some())
+    }
+
     pub fn finish(&mut self) {
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.paint_generation = GENERATION.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         // Stable sorts below retain insertion order among equal keys. Derive
         // slots from the same operation order, including untagged primitives.
         // This work happens only after an ordinary scene rebuild, never per tint.
         self.repaint_slots.clear();
+        self.passive_paint_bounds = None;
+        self.passive_paint_regions.clear();
         if !self.repaint_tags.is_empty() {
             let mut quads = Vec::new();
             let mut sprites = Vec::new();

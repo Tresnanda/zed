@@ -2716,6 +2716,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.start_display_link();
         } else {
             lock.stop_display_link();
+            lock.renderer.release_passive_region_target();
         }
     }
 }
