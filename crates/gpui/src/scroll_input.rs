@@ -16,6 +16,7 @@ struct ScrollInput {
     scheduled: bool,
     dispatching: bool,
     paint: Option<(std::time::Instant, std::time::Instant, usize)>,
+    test_clock_paused: bool,
 }
 impl Window {
     /// Set the painted viewport predicate for native wheel accumulation.
@@ -112,7 +113,20 @@ impl Window {
     }
 }
 
+// The normal platform-frame dirty-window path remains enabled. Only the
+// automation feature's eager per-effect draw loop is bypassed. Zero is the
+// same-addon diagnostic control; no new timer or idle frame is requested.
 pub(crate) fn scroll_input_frame_draw_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(||std::env::var("KYBERN_INPUT_FRAME_DRAW").as_deref()==Ok("1"))
+    *ENABLED.get_or_init(||std::env::var("KYBERN_INPUT_FRAME_DRAW").as_deref()!=Ok("0"))
+}
+
+impl Window {
+    /// Preserve eager deterministic painting while automation owns the clock.
+    pub fn kybern_set_test_clock_paused(&mut self, paused: bool) {
+        self.scroll_input.test_clock_paused = paused;
+    }
+    pub(crate) fn kybern_test_clock_paused(&self) -> bool {
+        self.scroll_input.test_clock_paused
+    }
 }

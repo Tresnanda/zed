@@ -5046,6 +5046,14 @@ impl Window {
         result
     }
 
+    /// Finish a dirty layout before an explicit synchronous geometry snapshot.
+    /// Ordinary input, observers and clean reads remain display paced.
+    pub fn kybern_prepare_snapshot(&mut self, cx: &mut App) {
+        if self.invalidator.is_dirty() {
+            self.draw(cx).clear(cx);
+        }
+    }
+
     /// Reuse root-relative layout geometry for a retained, unchanged scroll row.
     pub fn cache_scroll_layout(&mut self, id: LayoutId, key: [u64; 3]) {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
