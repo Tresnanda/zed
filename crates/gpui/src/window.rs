@@ -1221,6 +1221,8 @@ pub struct Window {
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     paint_animation_scheduled: bool,
+    stroke_draws: std::collections::HashMap<u64, std::sync::Arc<crate::scene::StrokeDraw>>,
+    stroke_svg_renderer: Option<crate::SvgRenderer>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1914,6 +1916,8 @@ impl Window {
             hovered,
             needs_present,
             paint_animation_scheduled: false,
+            stroke_draws: Default::default(),
+            stroke_svg_renderer: None,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3180,6 +3184,7 @@ impl Window {
         }
         let animated = self.rendered_frame.scene.animate_tagged();
         let animated = self.rendered_frame.scene.animate_fades() | animated;
+        let animated = self.animate_strokes() | animated;
         self.platform_window.draw(&self.rendered_frame.scene);
         if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
             let message=format!("[kybern-submit] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
@@ -8143,3 +8148,5 @@ include!("scroll_input.rs");
 include!("subtree_transform_window.rs");
 
 include!("stream_fade_window.rs");
+
+include!("stroke_draw_window.rs");

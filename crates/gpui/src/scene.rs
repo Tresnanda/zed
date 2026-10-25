@@ -47,6 +47,10 @@ pub struct Scene {
     pub(crate) fade_tags: std::collections::HashMap<usize, FadeTag>,
     fade_slots: std::collections::HashMap<usize, (u8, usize)>,
     pending_fade: Option<FadeTag>,
+    pub(crate) active_stroke: Option<std::sync::Arc<StrokeDraw>>,
+    pub(crate) stroke_tags: std::collections::HashMap<usize, std::sync::Arc<StrokeDraw>>,
+    stroke_slots: std::collections::HashMap<usize, usize>,
+    pending_stroke: Option<std::sync::Arc<StrokeDraw>>,
     /// Every scope painted into this scene, including ones that drew nothing (an empty glyph slot fading back in).
     pub(crate) transform_scopes: std::collections::HashSet<u64>,
     pub(crate) active_subtree_geometry: Option<std::sync::Arc<crate::window::SubtreeGeometry>>,
@@ -92,6 +96,10 @@ impl Scene {
         self.fade_tags.clear();
         self.fade_slots.clear();
         self.pending_fade = None;
+        self.active_stroke = None;
+        self.stroke_tags.clear();
+        self.stroke_slots.clear();
+        self.pending_stroke = None;
         self.subtree_geometries.clear();
         self.active_subtree_geometry = None;
         self.repaint_tags.clear();
@@ -162,6 +170,7 @@ impl Scene {
         self.maximum_order = self.maximum_order.max(order);
         if matches!(&primitive, Primitive::Backdrop(_)) { self.backdrop_order_offset = order + 1; }
         let fade_tag = self.fade_tag_for(&mut primitive);
+        let stroke_tag = self.stroke_tag_for(&primitive);
         match &mut primitive {
             Primitive::Backdrop(b) => { b.order=order; self.backdrops.push(*b); },
             Primitive::Shadow(shadow) => {
@@ -206,6 +215,7 @@ impl Scene {
         }
         if let Some(base) = transform_base { self.transform_bases.insert(self.paint_operations.len(), base); }
         if let Some(tag) = fade_tag { self.fade_tags.insert(self.paint_operations.len(), tag); }
+        if let Some(tag) = stroke_tag { self.stroke_tags.insert(self.paint_operations.len(), tag); }
         if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -220,6 +230,7 @@ impl Scene {
             self.active_subtree_geometry = prev_scene.subtree_geometries.get(&index).cloned().or_else(|| previous_geometry.clone());
             self.pending_transform_base = prev_scene.transform_bases.get(&index).cloned();
             self.pending_fade = prev_scene.fade_tags.get(&index).copied();
+            self.pending_stroke = prev_scene.stroke_tags.get(&index).cloned();
             let operation = &prev_scene.paint_operations[index];
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -231,6 +242,7 @@ impl Scene {
         self.active_subtree_geometry = previous_geometry;
         self.pending_transform_base = None;
         self.pending_fade = None;
+        self.pending_stroke = None;
     }
 
     /// Replace only recorded quad fills / monochrome tint, preserving geometry,
@@ -332,6 +344,7 @@ impl Scene {
 
     pub fn finish(&mut self) {
         self.fade_slots_update();
+        self.stroke_slots_update();
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.paint_generation = GENERATION.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         // Stable sorts below retain insertion order among equal keys. Derive
@@ -1355,3 +1368,5 @@ impl Scene {
 include!("subtree_scene.rs");
 
 include!("stream_fade.rs");
+
+include!("stroke_draw_scene.rs");
