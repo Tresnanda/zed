@@ -208,6 +208,7 @@ impl Scene {
             found.insert(id);
         }
         if found.len() != colors.len() { return false; }
+        let pop_centres = self.pop_centres();
         for (&index, &(id, kind, inherited_opacity, animation, _)) in &self.repaint_tags {
             let Some(color) = colors.get(&id) else { continue; };
             let color = color.opacity(inherited_opacity);
@@ -225,6 +226,14 @@ impl Scene {
                 (PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)), 1 | 2) => {
                     sprite.color = color;
                     self.monochrome_sprites[self.repaint_slots[&index].1].color = color;
+                    if let Some(animation) = animation.filter(|animation| animation.pop) {
+                        if let Some(&(cx, cy)) = pop_centres.get(&id) {
+                            let scale = animation.pop_state(paint_animation_clock(animation)).1;
+                            let grow = TransformationMatrix::unit().translate(Point::new(ScaledPixels(cx), ScaledPixels(cy))).scale(crate::Size { width: scale, height: scale }).translate(Point::new(ScaledPixels(-cx), ScaledPixels(-cy)));
+                            sprite.transformation = grow;
+                            self.monochrome_sprites[self.repaint_slots[&index].1].transformation = grow;
+                        }
+                    }
                     if let Some(animation) = animation.filter(|animation| animation.rotate) {
                         let centre = Point::new(ScaledPixels(sprite.bounds.origin.x.0 + sprite.bounds.size.width.0 / 2.0), ScaledPixels(sprite.bounds.origin.y.0 + sprite.bounds.size.height.0 / 2.0));
                         let turn = TransformationMatrix::unit().translate(centre).rotate(Radians(animation.angle(paint_animation_clock(animation)))).translate(Point::new(ScaledPixels(-centre.x.0), ScaledPixels(-centre.y.0)));
@@ -235,6 +244,15 @@ impl Scene {
                 (PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)), 2) => {
                     sprite.color=color;
                     self.subpixel_sprites[self.repaint_slots[&index].1].color=color;
+                    if let Some(animation) = animation.filter(|animation| animation.pop) {
+                        if let Some(&(cx, cy)) = pop_centres.get(&id) {
+                            let scale = animation.pop_state(paint_animation_clock(animation)).1;
+                            let grow = TransformationMatrix::unit().translate(Point::new(ScaledPixels(cx), ScaledPixels(cy))).scale(crate::Size { width: scale, height: scale }).translate(Point::new(ScaledPixels(-cx), ScaledPixels(-cy)));
+                            sprite.transformation = grow;
+                            self.subpixel_sprites[self.repaint_slots[&index].1].transformation = grow;
+                        }
+                    }
+
                 },
                 _ => unreachable!("validated above"),
             }
@@ -1150,14 +1168,16 @@ pub struct PaintAnimation {
     pub breathe: bool,
     pub shimmer: bool,
     pub rotate: bool,
+    pub pop: bool,
     pub started: std::time::Instant,
 }
 impl PaintAnimation {
     pub(crate) fn same_config(self, other: Self) -> bool {
-        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer && self.rotate == other.rotate
+        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer && self.rotate == other.rotate && self.pop == other.pop
     }
     fn opacity(self, now: std::time::Instant) -> f32 {
         if self.rotate { return 1.0; }
+        if self.pop { return self.pop_state(now).0; }
         let elapsed = now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
         if elapsed < 0.0 { return if self.breathe { 1.0 } else { 0.22 }; }
         let phase = (elapsed % self.cycle_ms) / self.cycle_ms;
@@ -1182,12 +1202,45 @@ impl PaintAnimation {
     }
 }
 /// The animation clock, frozen by `KYBERN_PAINT_PHASE_MS` for pixel comparisons (as `animate_tagged` does).
+impl PaintAnimation {
+    /// `t-pop` at `at`: (opacity, scale). `both` fill: the first keyframe during the delay, the last after the end.
+    pub(crate) fn pop_state(self, at: std::time::Instant) -> (f32, f32) {
+        let elapsed = at.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
+        let x = (elapsed / self.cycle_ms).clamp(0.0, 1.0);
+        // `--ease-bounce`: y(t) of cubic-bezier(0.34, 1.36, 0.64, 1) at the t whose x(t) is `x`.
+        let (x1, y1, x2, y2) = (0.34f64, 1.36f64, 0.64f64, 1.0f64);
+        let bez = |t: f64, a: f64, b: f64| 3.0 * a * t * (1.0 - t).powi(2) + 3.0 * b * t * t * (1.0 - t) + t * t * t;
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        for _ in 0..24 { let mid = (lo + hi) * 0.5; if bez(mid, x1, x2) < x { lo = mid; } else { hi = mid; } }
+        let e = bez((lo + hi) * 0.5, y1, y2);
+        ((0.4 + 0.6 * e).clamp(0.0, 1.0) as f32, (0.85 + 0.15 * e) as f32)
+    }
+    /// The curve has ended and the last frames (100 ms of margin) have been painted.
+    pub(crate) fn pop_done(self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 >= self.delay_ms + self.cycle_ms + 100.0
+    }
+}
 fn paint_animation_clock(animation: PaintAnimation) -> std::time::Instant {
     static PHASE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     let phase = *PHASE.get_or_init(|| std::env::var("KYBERN_PAINT_PHASE_MS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0));
     phase.map_or_else(std::time::Instant::now, |ms| animation.started + std::time::Duration::from_secs_f64(ms / 1000.0))
 }
 impl Scene {
+    fn pop_centres(&self) -> std::collections::HashMap<u64, (f32, f32)> {
+        let mut boxes: std::collections::HashMap<u64, [f32; 4]> = std::collections::HashMap::new();
+        for (&index, &(id, _, _, animation, _)) in &self.repaint_tags {
+            if !animation.is_some_and(|a| a.pop) { continue; }
+            let b = match &self.paint_operations[index] {
+                PaintOperation::Primitive(Primitive::MonochromeSprite(p)) => p.bounds,
+                PaintOperation::Primitive(Primitive::SubpixelSprite(p)) => p.bounds,
+                _ => continue,
+            };
+            let (x0, y0, x1, y1) = (b.origin.x.0, b.origin.y.0, b.origin.x.0 + b.size.width.0, b.origin.y.0 + b.size.height.0);
+            let e = boxes.entry(id).or_insert([x0, y0, x1, y1]);
+            e[0] = e[0].min(x0); e[1] = e[1].min(y0); e[2] = e[2].max(x1); e[3] = e[3].max(y1);
+        }
+        boxes.into_iter().map(|(id, b)| (id, ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5))).collect()
+    }
     pub(crate) fn animation_for(&self, id: u64) -> Option<PaintAnimation> {
         self.repaint_tags.values().find_map(|&(tag, _, _, animation, _)| if tag == id {animation} else {None})
     }
@@ -1197,7 +1250,7 @@ impl Scene {
         // shared by the tagged leaf. Evaluate the curve only once per leaf.
         let mut seen = std::collections::HashSet::new();
         let updates: Vec<_> = self.repaint_tags.values().filter_map(|&(id, _, _, animation, color)| {
-            if animation.is_none() || !seen.insert(id) { return None; }
+            if animation.is_none() || animation.is_some_and(|a| a.pop && a.pop_done(paint_animation_clock(a))) || !seen.insert(id) { return None; }
             animation.map(|animation| {
                 // Freeze only when explicitly requested by pixel comparisons.
                 static PHASE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
@@ -1208,6 +1261,12 @@ impl Scene {
                 (id,next)
             })
         }).collect();
-        !updates.is_empty() && self.repaint_tagged_inner(&updates, false)
+        if updates.is_empty() { return false; }
+        let ok = self.repaint_tagged_inner(&updates, false);
+        if !ok && std::env::var_os("KYBERN_DEBUG_PAINT_ANIMATION").is_some() {
+            let present: std::collections::HashSet<u64> = self.repaint_tags.values().map(|t| t.0).collect();
+            eprintln!("[paint-animation] stopped: {} tagged leaves, ids without paint: {:?}", updates.len(), updates.iter().filter(|(id, _)| !present.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
+        }
+        ok
     }
 }
