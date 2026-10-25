@@ -208,7 +208,7 @@ impl Scene {
             found.insert(id);
         }
         if found.len() != colors.len() { return false; }
-        for (&index, &(id, kind, inherited_opacity, _, _)) in &self.repaint_tags {
+        for (&index, &(id, kind, inherited_opacity, animation, _)) in &self.repaint_tags {
             let Some(color) = colors.get(&id) else { continue; };
             let color = color.opacity(inherited_opacity);
             let bounds = match &self.paint_operations[index] {
@@ -225,6 +225,12 @@ impl Scene {
                 (PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)), 1 | 2) => {
                     sprite.color = color;
                     self.monochrome_sprites[self.repaint_slots[&index].1].color = color;
+                    if let Some(animation) = animation.filter(|animation| animation.rotate) {
+                        let centre = Point::new(ScaledPixels(sprite.bounds.origin.x.0 + sprite.bounds.size.width.0 / 2.0), ScaledPixels(sprite.bounds.origin.y.0 + sprite.bounds.size.height.0 / 2.0));
+                        let turn = TransformationMatrix::unit().translate(centre).rotate(Radians(animation.angle(paint_animation_clock(animation)))).translate(Point::new(ScaledPixels(-centre.x.0), ScaledPixels(-centre.y.0)));
+                        sprite.transformation = turn;
+                        self.monochrome_sprites[self.repaint_slots[&index].1].transformation = turn;
+                    }
                 },
                 (PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)), 2) => {
                     sprite.color=color;
@@ -1143,13 +1149,15 @@ pub struct PaintAnimation {
     pub delay_ms: f64,
     pub breathe: bool,
     pub shimmer: bool,
+    pub rotate: bool,
     pub started: std::time::Instant,
 }
 impl PaintAnimation {
     pub(crate) fn same_config(self, other: Self) -> bool {
-        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer
+        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer && self.rotate == other.rotate
     }
     fn opacity(self, now: std::time::Instant) -> f32 {
+        if self.rotate { return 1.0; }
         let elapsed = now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
         if elapsed < 0.0 { return if self.breathe { 1.0 } else { 0.22 }; }
         let phase = (elapsed % self.cycle_ms) / self.cycle_ms;
@@ -1165,6 +1173,19 @@ impl PaintAnimation {
         else if phase<0.45 { 1.0 - 0.78*ease((phase-0.15)/0.3) }
         else { 0.22 }) as f32
     }
+}
+impl PaintAnimation {
+    /// Clockwise radians of a rotating glyph: one linear turn per `cycle_ms`.
+    pub(crate) fn angle(self, at: std::time::Instant) -> f32 {
+        let elapsed = at.saturating_duration_since(self.started).as_secs_f64() * 1000.0;
+        ((elapsed % self.cycle_ms) / self.cycle_ms * std::f64::consts::TAU) as f32
+    }
+}
+/// The animation clock, frozen by `KYBERN_PAINT_PHASE_MS` for pixel comparisons (as `animate_tagged` does).
+fn paint_animation_clock(animation: PaintAnimation) -> std::time::Instant {
+    static PHASE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let phase = *PHASE.get_or_init(|| std::env::var("KYBERN_PAINT_PHASE_MS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0));
+    phase.map_or_else(std::time::Instant::now, |ms| animation.started + std::time::Duration::from_secs_f64(ms / 1000.0))
 }
 impl Scene {
     pub(crate) fn animation_for(&self, id: u64) -> Option<PaintAnimation> {
