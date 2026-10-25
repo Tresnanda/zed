@@ -463,6 +463,9 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                     if alt {
                         mods |= OPTION_MOD;
                     }
+                    if modifiers.contains(NSEventModifierFlags::NSAlphaShiftKeyMask) {
+                        mods |= ALPHA_LOCK_MOD;
+                    }
 
                     key_char = Some(chars_for_modified_key(native_event.keyCode(), mods));
                 }
@@ -508,6 +511,7 @@ const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
 const SHIFT_MOD: u32 = 2;
 const OPTION_MOD: u32 = 8;
+const ALPHA_LOCK_MOD: u32 = 4;
 
 fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
