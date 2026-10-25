@@ -204,6 +204,7 @@ mod tests {
                     size(ScaledPixels(64.), ScaledPixels(64.)),
                 ),
                 content_mask: ContentMask {
+                    rounded_clip: 0, clip_generation: 0,
                     bounds: bounds(
                         point(ScaledPixels(0.), ScaledPixels(0.)),
                         size(ScaledPixels(64.), ScaledPixels(64.)),

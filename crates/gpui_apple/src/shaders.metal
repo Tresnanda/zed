@@ -2,6 +2,40 @@
 #include <simd/simd.h>
 
 using namespace metal;
+struct RoundedClipNode { float bounds[4]; float radii[4]; uint parent; uint kind; };
+// Edge fade link (N3): ramps are top, right, bottom, left; 0 leaves that edge alone.
+float edge_fade_alpha(float2 p, float2 lo, float2 size, float4 band) {
+  float4 d=float4(p.y-lo.y, lo.x+size.x-p.x, lo.y+size.y-p.y, p.x-lo.x);
+  float4 r=select(float4(1.), saturate(d/max(band,float4(1e-4))), band>0.);
+  float m=min(min(r.x,r.y),min(r.z,r.w));
+  return m*m;
+}
+// All scene primitives share this analytic intersection. Interior fragments take
+// cheap comparisons; only corner pixels evaluate a circle distance. Edge fades
+// multiply, so nested scopes compound.
+float rounded_clip_alpha(float2 p, uint id, device const RoundedClipNode *clips) {
+  float coverage=1., fade=1.;
+  while(id!=0) {
+    RoundedClipNode n=clips[id];
+    float2 lo=float2(n.bounds[0],n.bounds[1]), size=float2(n.bounds[2],n.bounds[3]);
+    if(n.kind!=0) {
+      fade*=edge_fade_alpha(p,lo,size,float4(n.radii[0],n.radii[1],n.radii[2],n.radii[3]));
+      id=n.parent;
+      continue;
+    }
+    bool right=p.x>=lo.x+size.x/2., bottom=p.y>=lo.y+size.y/2.;
+    float r=n.radii[bottom?(right?2:3):(right?1:0)];
+    float2 c=lo+float2(right?size.x-r:r,bottom?size.y-r:r);
+    float2 q=float2(right?p.x-c.x:c.x-p.x,bottom?p.y-c.y:c.y-p.y);
+    float distance=length(max(q,0.))+min(max(q.x,q.y),0.)-r;
+    if(any(p<lo)||any(p>=lo+size)||distance>=0.5) discard_fragment();
+    coverage=min(coverage,saturate(0.5-distance));
+    id=n.parent;
+  }
+  if(fade<=0.) discard_fragment();
+  return coverage*fade;
+}
+
 
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
@@ -99,7 +133,9 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+                              [[buffer(QuadInputIndex_Quads)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, quads[input.quad_id].content_mask.rounded_clip, clips);
+
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -115,7 +151,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return (background_color) * float4(1.,1.,1.,clip_alpha);
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
@@ -175,7 +211,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return (background_color) * float4(1.,1.,1.,clip_alpha);
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -393,7 +429,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return (color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf))) * float4(1.,1.,1.,clip_alpha);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -496,7 +532,9 @@ vertex ShadowVertexOutput shadow_vertex(
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
+                                [[buffer(ShadowInputIndex_Shadows)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, shadows[input.shadow_id].content_mask.rounded_clip, clips);
+
   Shadow shadow = shadows[input.shadow_id];
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
@@ -551,7 +589,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  return (input.color * float4(1., 1., 1., alpha)) * float4(1.,1.,1.,clip_alpha);
 }
 
 struct UnderlineVertexOutput {
@@ -589,7 +627,9 @@ vertex UnderlineVertexOutput underline_vertex(
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
                                    constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
+                                   [[buffer(UnderlineInputIndex_Underlines)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, underlines[input.underline_id].content_mask.rounded_clip, clips);
+
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
@@ -612,13 +652,14 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return (input.color * float4(1., 1., 1., alpha)) * float4(1.,1.,1.,clip_alpha);
   } else {
-    return input.color;
+    return (input.color) * float4(1.,1.,1.,clip_alpha);
   }
 }
 
 struct MonochromeSpriteVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
@@ -626,6 +667,7 @@ struct MonochromeSpriteVertexOutput {
 };
 
 struct MonochromeSpriteFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 tile_position;
   float4 color [[flat]];
@@ -649,6 +691,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
   return MonochromeSpriteVertexOutput{
+      sprite.content_mask.rounded_clip,
       device_position,
       tile_position,
       color,
@@ -658,9 +701,11 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, input.rounded_clip, clips);
+
   if (any(input.clip_distance < float4(0.0))) {
-    return float4(0.0);
+    return (float4(0.0)) * float4(1.,1.,1.,clip_alpha);
   }
 
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
@@ -669,7 +714,7 @@ fragment float4 monochrome_sprite_fragment(
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
   color.a *= sample.a;
-  return color;
+  return (color) * float4(1.,1.,1.,clip_alpha);
 }
 
 struct PolychromeSpriteVertexOutput {
@@ -711,7 +756,9 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, sprites[input.sprite_id].content_mask.rounded_clip, clips);
+
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear);
   constexpr sampler nearest_neighbor_sampler(mag_filter::nearest,
@@ -731,7 +778,7 @@ fragment float4 polychrome_sprite_fragment(
     color.b = grayscale;
   }
   color.a *= sprite.opacity * saturate(0.5 - distance);
-  return color;
+  return (color) * float4(1.,1.,1.,clip_alpha);
 }
 
 struct PathRasterizationVertexOutput {
@@ -775,7 +822,9 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
-) {
+, device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, vertices[input.vertex_id].rounded_clip, clips);
+
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
@@ -811,7 +860,7 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
-  return float4(color.rgb * color.a * alpha, alpha * color.a);
+  return (float4(color.rgb * color.a * alpha, alpha * color.a)) * clip_alpha;
 }
 
 struct PathSpriteVertexOutput {
@@ -851,12 +900,14 @@ fragment float4 path_sprite_fragment(
 }
 
 struct SurfaceVertexOutput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 texture_position;
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
+  uint rounded_clip [[flat]];
   float4 position [[position]];
   float2 texture_position;
 };
@@ -879,6 +930,7 @@ vertex SurfaceVertexOutput surface_vertex(
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
   return SurfaceVertexOutput{
+      surface.content_mask.rounded_clip,
       device_position,
       texture_position,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
@@ -888,7 +940,9 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+  float clip_alpha=rounded_clip_alpha(input.position.xy, input.rounded_clip, clips);
+
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -899,7 +953,7 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  return (ycbcrToRGBTransform * ycbcr) * float4(1.,1.,1.,clip_alpha);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

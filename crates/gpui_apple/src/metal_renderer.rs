@@ -158,6 +158,7 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub rounded_clip: u32,
 }
 
 impl MetalRenderer {
@@ -838,11 +839,13 @@ impl MetalRenderer {
             self.paint_region_scissor = region;
             if let Some(mut rect) = region { if let Some((x,y))=self.paint_region_origin {rect.x=(rect.x as i64-x).max(0) as u64;rect.y=(rect.y as i64-y).max(0) as u64;} command_encoder.set_scissor_rect(rect); }
             self.clear_paint_region(command_encoder, alpha as f32);
+        let rounded_clips = writer.write(&scene.rounded_clips)?;
         for batch in scene.batches() {
+            command_encoder.set_fragment_buffer(7, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
             match batch {
                 PrimitiveBatch::Backdrop(index) => {
                     command_encoder.end_encoding();
-                    self.draw_backdrop(&scene.backdrops[index],texture,viewport_size,command_buffer)?;
+                    self.draw_backdrop(&scene.backdrops[index],texture,viewport_size,command_buffer,&rounded_clips)?;
                     command_encoder=new_command_encoder_for_texture(command_buffer,texture,viewport_size,None);
                 },
                 PrimitiveBatch::Shadows(range) => {
@@ -857,6 +860,7 @@ impl MetalRenderer {
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        &rounded_clips,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -928,6 +932,7 @@ impl MetalRenderer {
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        rounded_clips: &InstanceBinding,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -947,6 +952,7 @@ impl MetalRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
+                rounded_clip: path.content_mask.rounded_clip,
             }));
         }
         let vertex_instance_bindings = writer.write(&vertices)?;
@@ -969,6 +975,7 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_fragment_buffer(7, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,

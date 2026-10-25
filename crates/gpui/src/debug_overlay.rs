@@ -137,6 +137,7 @@ impl DebugFrameOverlay {
         let panel_top = cell * PANEL_MARGIN;
 
         let content_mask = ContentMask {
+            rounded_clip: 0, clip_generation: 0,
             bounds: Bounds {
                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
                 size: viewport,

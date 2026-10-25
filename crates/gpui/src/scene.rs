@@ -56,6 +56,9 @@ pub struct Scene {
     pub backdrops: Vec<Backdrop>,
     backdrop_order_offset: u32,
     maximum_order: u32,
+    /// Rounded masks shared by all primitive types, in device pixels.
+    pub rounded_clips: Vec<RoundedClip>,
+    pub(crate) rounded_clip_scale: f32,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -79,6 +82,7 @@ impl Scene {
         self.layer_stack.clear();
         self.paths.clear();
         self.backdrops.clear(); self.backdrop_order_offset=0; self.maximum_order=0;
+        self.rounded_clips.clear();
         self.shadows.clear();
         self.quads.clear();
         self.underlines.clear();
@@ -269,6 +273,8 @@ impl Scene {
         if !*DIRECT.get_or_init(|| std::env::var("KYBERN_SCOPED_BUFFERS").as_deref() != Ok("0")) {
             let previous = std::mem::take(self);
             self.replay(0..previous.len(), &previous);
+        self.rounded_clips = previous.rounded_clips.clone();
+        self.rounded_clip_scale = previous.rounded_clip_scale;
             self.finish();
         }
         true
@@ -1268,5 +1274,33 @@ impl Scene {
             eprintln!("[paint-animation] stopped: {} tagged leaves, ids without paint: {:?}", updates.len(), updates.iter().filter(|(id, _)| !present.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>());
         }
         ok
+    }
+}
+
+/// One immutable link of an arbitrarily nested rounded content mask. `kind` 1
+/// is an edge fade (N3): `radii` then hold the top, right, bottom and left ramps.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+#[allow(missing_docs)]
+pub struct RoundedClip { pub bounds: [f32;4], pub radii: [f32;4], pub parent: u32, pub kind: u32 }
+impl Scene {
+    pub(crate) fn rounded_contains(&self, mut id:u32, point:Point<Pixels>) -> bool {
+        let x=point.x.as_f32()*self.rounded_clip_scale; let y=point.y.as_f32()*self.rounded_clip_scale;
+        while id!=0 {
+            let Some(n)=self.rounded_clips.get(id as usize) else {return false;};
+            // Hit testing ignores edge fades.
+            if n.kind!=0 { id=n.parent; continue; }
+            let [left,top,width,height]=n.bounds;
+            if x<left || y<top || x>=left+width || y>=top+height { return false; }
+            let right=x>=left+width/2.; let bottom=y>=top+height/2.;
+            let radius=n.radii[match(right,bottom){(false,false)=>0,(true,false)=>1,(true,true)=>2,(false,true)=>3}];
+            let cx=if right {left+width-radius} else {left+radius};
+            let cy=if bottom {top+height-radius} else {top+radius};
+            let dx=if right {(x-cx).max(0.)} else {(cx-x).max(0.)};
+            let dy=if bottom {(y-cy).max(0.)} else {(cy-y).max(0.)};
+            if dx*dx+dy*dy>radius*radius { return false; }
+            id=n.parent;
+        }
+        true
     }
 }

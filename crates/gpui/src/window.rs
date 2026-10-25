@@ -1094,7 +1094,7 @@ impl Frame {
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&position) && self.scene.rounded_contains(hitbox.content_mask.rounded_clip, position) {
                 let ancestor = ancestor_path.is_some_and(|child| hitbox.identity.as_ref().is_some_and(|parent|
                     parent.0.len() < child.0.len() && child.0.starts_with(&parent.0)));
                 if ancestor && set_hover_hitbox_count {
@@ -1183,6 +1183,7 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    rounded_clip_pool: RoundedClipPool,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1872,6 +1873,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            rounded_clip_pool: Default::default(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -1952,6 +1954,10 @@ pub struct DispatchEventResult {
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// Immutable rounded clip chain, zero for a rectangle.
+    pub rounded_clip: u32,
+    /// Cache-key generation for a recycled clip slot.
+    pub clip_generation: u32,
 }
 
 impl ContentMask<Pixels> {
@@ -1959,13 +1965,16 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            rounded_clip: self.rounded_clip, clip_generation: self.clip_generation,
         }
     }
 
     /// Intersect the content mask with the given content mask.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        // A style-created rounded chain already includes its inherited mask.
+        let rounded = if self.rounded_clip != 0 { self } else { other };
+        ContentMask { bounds, rounded_clip: rounded.rounded_clip, clip_generation: rounded.clip_generation }
     }
 }
 
@@ -2882,6 +2891,7 @@ impl Window {
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
+            rounded_clip: self.content_mask().rounded_clip, clip_generation: self.content_mask().clip_generation,
         }
     }
 
@@ -3003,6 +3013,8 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             self.captured_hitbox = None;
+            let clip_scale=self.scale_factor();
+            self.rounded_clip_pool.seed(&mut self.next_frame.scene,clip_scale);
             self.draw_roots(cx);
             if self.captured_identity.is_some() && self.captured_hitbox.is_none() {
                 self.captured_identity = None;
@@ -3039,6 +3051,8 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        let clip_scale = self.scale_factor();
+        self.rounded_clip_pool.snapshot(&mut self.next_frame, clip_scale);
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3888,6 +3902,7 @@ impl Window {
             .last()
             .cloned()
             .unwrap_or_else(|| ContentMask {
+                rounded_clip: 0, clip_generation: 0,
                 bounds: Bounds {
                     origin: Point::default(),
                     size: self.viewport_size,
@@ -4336,6 +4351,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        ..quad.content_mask
                     },
                     ..quad
                 });
@@ -8064,3 +8080,5 @@ thread_local! {
     static KYBERN_LAYOUT_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
     static KYBERN_LAYOUT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+include!("rounded_clip.rs");
