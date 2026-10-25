@@ -43,6 +43,10 @@ pub struct Scene {
     pub(crate) active_transform: Option<std::sync::Arc<crate::window::SubtreeTransformContext>>,
     pub(crate) transform_bases: std::collections::HashMap<usize, (Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
     pending_transform_base: Option<(Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
+    pub(crate) active_fade: Option<Vec<FadeWord>>,
+    pub(crate) fade_tags: std::collections::HashMap<usize, FadeTag>,
+    fade_slots: std::collections::HashMap<usize, (u8, usize)>,
+    pending_fade: Option<FadeTag>,
     /// Every scope painted into this scene, including ones that drew nothing (an empty glyph slot fading back in).
     pub(crate) transform_scopes: std::collections::HashSet<u64>,
     pub(crate) active_subtree_geometry: Option<std::sync::Arc<crate::window::SubtreeGeometry>>,
@@ -84,6 +88,10 @@ impl Scene {
         self.transform_bases.clear();
         self.active_transform = None;
         self.pending_transform_base = None;
+        self.active_fade = None;
+        self.fade_tags.clear();
+        self.fade_slots.clear();
+        self.pending_fade = None;
         self.subtree_geometries.clear();
         self.active_subtree_geometry = None;
         self.repaint_tags.clear();
@@ -153,6 +161,7 @@ impl Scene {
         let order = if matches!(&primitive, Primitive::Backdrop(_)) { self.maximum_order + 1 } else { order + self.backdrop_order_offset };
         self.maximum_order = self.maximum_order.max(order);
         if matches!(&primitive, Primitive::Backdrop(_)) { self.backdrop_order_offset = order + 1; }
+        let fade_tag = self.fade_tag_for(&mut primitive);
         match &mut primitive {
             Primitive::Backdrop(b) => { b.order=order; self.backdrops.push(*b); },
             Primitive::Shadow(shadow) => {
@@ -196,6 +205,7 @@ impl Scene {
             }
         }
         if let Some(base) = transform_base { self.transform_bases.insert(self.paint_operations.len(), base); }
+        if let Some(tag) = fade_tag { self.fade_tags.insert(self.paint_operations.len(), tag); }
         if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -209,6 +219,7 @@ impl Scene {
             self.active_repaint_tag = prev_scene.repaint_tags.get(&index).copied();
             self.active_subtree_geometry = prev_scene.subtree_geometries.get(&index).cloned().or_else(|| previous_geometry.clone());
             self.pending_transform_base = prev_scene.transform_bases.get(&index).cloned();
+            self.pending_fade = prev_scene.fade_tags.get(&index).copied();
             let operation = &prev_scene.paint_operations[index];
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -219,6 +230,7 @@ impl Scene {
         self.active_repaint_tag = previous_tag;
         self.active_subtree_geometry = previous_geometry;
         self.pending_transform_base = None;
+        self.pending_fade = None;
     }
 
     /// Replace only recorded quad fills / monochrome tint, preserving geometry,
@@ -315,10 +327,11 @@ impl Scene {
 
     /// Whether this scene contains a visible declarative passive-paint loop.
     pub fn has_native_paint_animation(&self) -> bool {
-        self.repaint_tags.values().any(|(_,_,_,animation,_)| animation.is_some())
+        self.repaint_tags.values().any(|(_,_,_,animation,_)| animation.is_some_and(|a| !(a.pop && a.pop_done(paint_animation_clock(a)))))
     }
 
     pub fn finish(&mut self) {
+        self.fade_slots_update();
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.paint_generation = GENERATION.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         // Stable sorts below retain insertion order among equal keys. Derive
@@ -1284,6 +1297,7 @@ impl Scene {
         self.repaint_tags.values().find_map(|&(tag, _, _, animation, _)| if tag == id {animation} else {None})
     }
     pub(crate) fn animate_tagged(&mut self) -> bool {
+        self.finish_pops();
         let now = std::time::Instant::now();
         // Text contributes a primitive per glyph, but its phase/base tint are
         // shared by the tagged leaf. Evaluate the curve only once per leaf.
@@ -1339,3 +1353,5 @@ impl Scene {
 }
 
 include!("subtree_scene.rs");
+
+include!("stream_fade.rs");

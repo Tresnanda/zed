@@ -3179,6 +3179,7 @@ impl Window {
             let message=format!("[kybern-frame] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
         }
         let animated = self.rendered_frame.scene.animate_tagged();
+        let animated = self.rendered_frame.scene.animate_fades() | animated;
         self.platform_window.draw(&self.rendered_frame.scene);
         if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
             let message=format!("[kybern-submit] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
@@ -8140,3 +8141,5 @@ include!("subtree_geometry.rs");
 include!("scroll_input.rs");
 
 include!("subtree_transform_window.rs");
+
+include!("stream_fade_window.rs");
