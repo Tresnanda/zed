@@ -923,6 +923,8 @@ pub enum HitboxBehavior {
     /// inconsistent UI where clicks and moves interact with elements that are not considered to
     /// be hovered.
     BlockMouseExceptScroll,
+    /// Blocks overlapping siblings but preserves mouse routing to ancestors.
+    BlockNonAncestorMouse,
 }
 
 /// An identifier for a tooltip.
@@ -1088,11 +1090,24 @@ impl Frame {
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
+        let mut ancestor_path: Option<&GlobalElementId> = None;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
-                hit_test.ids.push(hitbox.id);
+                let ancestor = ancestor_path.is_some_and(|child| hitbox.identity.as_ref().is_some_and(|parent|
+                    parent.0.len() < child.0.len() && child.0.starts_with(&parent.0)));
+                if ancestor && set_hover_hitbox_count {
+                    hit_test.ids.insert(hit_test.hover_hitbox_count, hitbox.id);
+                    hit_test.hover_hitbox_count += 1;
+                } else {
+                    hit_test.ids.push(hitbox.id);
+                }
+                if !set_hover_hitbox_count && hitbox.behavior == HitboxBehavior::BlockNonAncestorMouse {
+                    ancestor_path = hitbox.identity.as_ref();
+                    hit_test.hover_hitbox_count = hit_test.ids.len();
+                    set_hover_hitbox_count = true;
+                }
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
                 {

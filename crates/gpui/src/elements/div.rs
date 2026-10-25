@@ -1238,6 +1238,13 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::block_mouse_except_scroll`].
     ///
     /// See [`Hitbox::is_hovered`] for details.
+    /// Occlude overlapping siblings, retaining mouse routing to ancestors.
+    fn block_non_ancestor_mouse(mut self) -> Self {
+        self.interactivity().hitbox_behavior = HitboxBehavior::BlockNonAncestorMouse;
+        self
+    }
+
+    /// Block non-scroll mouse interactions behind this element.
     fn block_mouse_except_scroll(mut self) -> Self {
         self.interactivity().block_mouse_except_scroll();
         self
