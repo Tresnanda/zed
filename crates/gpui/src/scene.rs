@@ -40,6 +40,11 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    pub(crate) active_transform: Option<std::sync::Arc<crate::window::SubtreeTransformContext>>,
+    pub(crate) transform_bases: std::collections::HashMap<usize, (Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
+    pending_transform_base: Option<(Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
+    /// Every scope painted into this scene, including ones that drew nothing (an empty glyph slot fading back in).
+    pub(crate) transform_scopes: std::collections::HashSet<u64>,
     pub(crate) active_subtree_geometry: Option<std::sync::Arc<crate::window::SubtreeGeometry>>,
     pub(crate) subtree_geometries: std::collections::HashMap<usize, std::sync::Arc<crate::window::SubtreeGeometry>>,
     // A tag identifies a passive fixed-geometry leaf, never a scene position.
@@ -75,6 +80,10 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.transform_scopes.clear();
+        self.transform_bases.clear();
+        self.active_transform = None;
+        self.pending_transform_base = None;
         self.subtree_geometries.clear();
         self.active_subtree_geometry = None;
         self.repaint_tags.clear();
@@ -115,11 +124,22 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        let transform_base = match (self.pending_transform_base.take(), self.active_transform.clone()) {
+            // Painted (or a cached range replayed) inside an active scope: map the untransformed base.
+            (pending, Some(context)) => {
+                let base = pending.map_or_else(|| primitive.clone(), |(base, _)| base);
+                primitive = base.clone();
+                primitive.transform_subtree(&context);
+                Some((base, context))
+            }
+            // Replayed outside any scope (a retained update, an island holding its own scope): as recorded.
+            (pending, None) => pending,
+        };
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
-        if clipped_bounds.is_empty() && self.active_subtree_geometry.is_none() {
+        if clipped_bounds.is_empty() && self.active_subtree_geometry.is_none() && transform_base.is_none() {
             return;
         }
 
@@ -175,17 +195,20 @@ impl Scene {
                 self.repaint_tags.insert(self.paint_operations.len(), tag);
             }
         }
+        if let Some(base) = transform_base { self.transform_bases.insert(self.paint_operations.len(), base); }
         if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        if range.start == 0 && range.end == prev_scene.paint_operations.len() { self.transform_scopes.extend(prev_scene.transform_scopes.iter().copied()); }
         let previous_geometry = self.active_subtree_geometry.clone();
         let previous_tag = self.active_repaint_tag;
         for index in range {
             self.active_repaint_tag = prev_scene.repaint_tags.get(&index).copied();
             self.active_subtree_geometry = prev_scene.subtree_geometries.get(&index).cloned().or_else(|| previous_geometry.clone());
+            self.pending_transform_base = prev_scene.transform_bases.get(&index).cloned();
             let operation = &prev_scene.paint_operations[index];
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -195,6 +218,7 @@ impl Scene {
         }
         self.active_repaint_tag = previous_tag;
         self.active_subtree_geometry = previous_geometry;
+        self.pending_transform_base = None;
     }
 
     /// Replace only recorded quad fills / monochrome tint, preserving geometry,

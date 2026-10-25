@@ -833,6 +833,7 @@ pub struct Hitbox {
     pub behavior: HitboxBehavior,
     identity: Option<GlobalElementId>,
     subtree_geometry: Option<SubtreeGeometry>,
+    transform_base: Option<(Bounds<Pixels>, std::sync::Arc<SubtreeTransformContext>)>,
 }
 
 impl Hitbox {
@@ -1185,6 +1186,7 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     rounded_clip_pool: RoundedClipPool,
+    subtree_transform: SubtreeTransformState,
     scroll_input: ScrollInput,
     subtree_tags: Vec<(u64, Point<Pixels>)>,
     subtree_a11y: std::collections::HashMap<accesskit::NodeId,SubtreeGeometry>,
@@ -1880,6 +1882,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             rounded_clip_pool: Default::default(),
+            subtree_transform: Default::default(),
             scroll_input: Default::default(),
             subtree_tags: Vec::new(),
             subtree_a11y: Default::default(),
@@ -3754,11 +3757,13 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
             self.push_subtree_mask(mask);
+            self.push_transform_mask(mask);
             let mask = mask.intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
             self.pop_subtree_mask();
+            self.pop_transform_mask();
             result
         } else {
             f(self)
@@ -4326,7 +4331,7 @@ impl Window {
             border_style: quad.border_style,
         };
 
-        if !self.subtree_tags.is_empty() {self.next_frame.scene.insert_primitive(quad);return;}
+        if !self.subtree_tags.is_empty() || self.subtree_transform.context.is_some() {self.next_frame.scene.insert_primitive(quad);return;}
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);
             return;
@@ -5085,7 +5090,9 @@ impl Window {
             behavior,
             identity,
             subtree_geometry: self.subtree_geometry(),
+            transform_base: None,
         };
+        let hitbox = self.transform_hitbox(hitbox);
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
     }
@@ -8131,3 +8138,5 @@ include!("rounded_clip.rs");
 include!("subtree_geometry.rs");
 
 include!("scroll_input.rs");
+
+include!("subtree_transform_window.rs");

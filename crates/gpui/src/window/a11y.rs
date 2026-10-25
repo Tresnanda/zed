@@ -900,3 +900,5 @@ mod tests {
 }
 
 include!("../subtree_a11y.rs");
+
+include!("../subtree_transform_a11y.rs");
