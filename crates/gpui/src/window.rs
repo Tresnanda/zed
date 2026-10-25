@@ -4195,6 +4195,18 @@ impl Window {
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
+    /// Filter earlier scene content within these bounds before painting children.
+    pub fn paint_backdrop(&mut self, bounds: Bounds<Pixels>, blur: Pixels, saturation:f32, radius:Pixels, opacity:f32, fade_top:f32) {
+        self.invalidator.debug_assert_paint();
+        if self.element_opacity() * opacity <= 0.0 { return; }
+        let primitive=crate::Backdrop {
+            order:0, bounds:bounds.scale(self.scale_factor()), content_mask:self.snapped_content_mask(),
+            blur:blur.scale(self.scale_factor()), radius:radius.scale(self.scale_factor()), saturation,
+            opacity:self.element_opacity() * opacity.clamp(0.0,1.0), fade_top,
+        };
+        self.next_frame.scene.insert_primitive(primitive);
+    }
+    /// Paint a filled or bordered quad.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 

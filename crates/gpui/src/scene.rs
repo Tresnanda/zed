@@ -42,6 +42,9 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    pub backdrops: Vec<Backdrop>,
+    backdrop_order_offset: u32,
+    maximum_order: u32,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -59,6 +62,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
+        self.backdrops.clear(); self.backdrop_order_offset=0; self.maximum_order=0;
         self.shadows.clear();
         self.quads.clear();
         self.underlines.clear();
@@ -99,7 +103,13 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        // Filtering is an ordering barrier, including inside paint_layer.
+        // Offset subsequent natural bounds-tree orders; clamping loses ordering.
+        let order = if matches!(&primitive, Primitive::Backdrop(_)) { self.maximum_order + 1 } else { order + self.backdrop_order_offset };
+        self.maximum_order = self.maximum_order.max(order);
+        if matches!(&primitive, Primitive::Backdrop(_)) { self.backdrop_order_offset = order + 1; }
         match &mut primitive {
+            Primitive::Backdrop(b) => { b.order=order; self.backdrops.push(*b); },
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
@@ -149,6 +159,7 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
+        self.backdrops.sort_by_key(|b| b.order);
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -171,6 +182,7 @@ impl Scene {
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            backdrops_start: 0, backdrops_iter: self.backdrops.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -200,6 +212,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    Backdrop,
     Shadow,
     #[default]
     Quad,
@@ -220,6 +233,7 @@ pub(crate) enum PaintOperation {
 #[derive(Clone)]
 #[expect(missing_docs)]
 pub enum Primitive {
+    Backdrop(Backdrop),
     Shadow(Shadow),
     Quad(Quad),
     Path(Path<ScaledPixels>),
@@ -234,6 +248,7 @@ pub enum Primitive {
 impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
+            Primitive::Backdrop(b) => &b.bounds,
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
@@ -247,6 +262,7 @@ impl Primitive {
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
+            Primitive::Backdrop(b) => &b.content_mask,
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
@@ -267,6 +283,7 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    backdrops_start: usize, backdrops_iter: Peekable<slice::Iter<'a, Backdrop>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -290,6 +307,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (self.backdrops_iter.peek().map(|b|b.order),PrimitiveKind::Backdrop),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -328,6 +346,7 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::Backdrop => { let i=self.backdrops_start; self.backdrops_start+=1; self.backdrops_iter.next(); Some(PrimitiveBatch::Backdrop(i)) },
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -475,6 +494,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    Backdrop(usize),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -499,6 +519,7 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::Backdrop(_) => "backdrop".into(),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
@@ -968,3 +989,18 @@ impl PathVertex<Pixels> {
         }
     }
 }
+
+/// A scene-local backdrop filter. Only the Metal backend implements it.
+#[derive(Clone,Copy,Debug)]
+#[allow(missing_docs)]
+pub struct Backdrop {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub blur: ScaledPixels,
+    pub radius: ScaledPixels,
+    pub saturation: f32,
+    pub opacity: f32,
+    pub fade_top: f32,
+}
+impl From<Backdrop> for Primitive { fn from(b:Backdrop)->Self {Self::Backdrop(b)} }

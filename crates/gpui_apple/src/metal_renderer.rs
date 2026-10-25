@@ -131,6 +131,7 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    backdrop_resources: Option<BackdropResources>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -365,6 +366,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            backdrop_resources: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -757,8 +759,14 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        if let Some(r)=&mut self.backdrop_resources { r.begin_frame(!scene.backdrops.is_empty()); }
         for batch in scene.batches() {
             match batch {
+                PrimitiveBatch::Backdrop(index) => {
+                    command_encoder.end_encoding();
+                    self.draw_backdrop(&scene.backdrops[index],texture,viewport_size,command_buffer)?;
+                    command_encoder=new_command_encoder_for_texture(command_buffer,texture,viewport_size,None);
+                },
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
                 }
@@ -1718,3 +1726,5 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+include!("backdrop_renderer.rs");
