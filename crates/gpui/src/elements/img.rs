@@ -583,6 +583,23 @@ impl ImageSource {
         }
     }
 
+    /// Inspect decoded pixels without triggering I/O or decode.
+    pub fn cached_image(&self, cx: &App) -> Option<Arc<RenderImage>> {
+        match self {
+            Self::Resource(resource) => cx.peek_asset::<ImgResourceLoader>(resource).and_then(Result::ok),
+            Self::Image(data) => cx.peek_asset::<AssetLogger<ImageDecoder>>(data).and_then(Result::ok),
+            Self::Render(data) => Some(data.clone()),
+            Self::Custom(_) => None,
+        }
+    }
+
+    /// Release the asset task and all windows' decoded image atlas tiles.
+    pub fn evict(&self, window: Option<&mut Window>, cx: &mut App) {
+        let image = self.cached_image(cx);
+        self.remove_asset(cx);
+        if let Some(image) = image { cx.drop_image(image, window); }
+    }
+
     /// Remove this image source from the asset system
     pub fn remove_asset(&self, cx: &mut App) {
         match self {

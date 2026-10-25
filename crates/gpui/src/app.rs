@@ -2644,6 +2644,12 @@ impl App {
         self.prompt_builder = Some(PromptBuilder::Default);
     }
 
+    /// Return an already completed asset without starting or retaining a load.
+    pub fn peek_asset<A: Asset>(&self, source: &A::Source) -> Option<A::Output> {
+        self.loading_assets.get(&(TypeId::of::<A>(), hash(source)))?
+            .downcast_ref::<Shared<Task<A::Output>>>()?.clone().now_or_never()
+    }
+
     /// Remove an asset from GPUI's cache
     pub fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
         let asset_id = (TypeId::of::<A>(), hash(source));

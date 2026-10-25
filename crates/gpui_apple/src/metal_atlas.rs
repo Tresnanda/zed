@@ -98,6 +98,7 @@ impl PlatformAtlas for MetalAtlas {
     }
 
     fn remove(&self, key: &AtlasKey) {
+        self.wait_for_pending_submissions();
         let mut lock = self.state.lock();
         let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
