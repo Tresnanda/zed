@@ -5074,6 +5074,13 @@ impl Window {
 
     /// Finish a dirty layout before an explicit synchronous geometry snapshot.
     /// Ordinary input, observers and clean reads remain display paced.
+    /// Complete layout and sample retained strokes for an explicit image snapshot.
+    pub fn kybern_prepare_image_snapshot(&mut self, cx: &mut App) {
+        self.kybern_prepare_snapshot(cx);
+        self.animate_strokes();
+    }
+
+    /// Finish a dirty layout before an explicit synchronous geometry snapshot.
     pub fn kybern_prepare_snapshot(&mut self, cx: &mut App) {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
