@@ -6,6 +6,17 @@ pub(crate) struct HoverReconcileEvent {
 impl HoverReconcileEvent {
     pub(crate) fn hovered(&self, hitbox: &Hitbox, window: &Window) -> Option<bool> {
         if self.retired {
+            if let Some(owner) = hitbox.hover_owner {
+                if let Some(live) = window.rendered_frame.hitboxes.iter()
+                    .find(|live| live.hover_owner == Some(owner))
+                {
+                    // New and retired paths can have distinct was_hovered cells.
+                    // A queued old leave would run after the new paint's enter.
+                    // Suppress it only while the live owner is actually hovered;
+                    // a relocated/occluded owner must still deliver its leave.
+                    return (!live.is_hovered(window)).then_some(false);
+                }
+            }
             // Rebuilt elements have fresh hitbox ids but the same identity.
             // Replayed cached listeners were moved into the current frame.
             if window

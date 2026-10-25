@@ -839,6 +839,7 @@ pub struct Hitbox {
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
     identity: Option<GlobalElementId>,
+    hover_owner: Option<(EntityId, u64)>,
     subtree_geometry: Option<SubtreeGeometry>,
     transform_base: Option<(Bounds<Pixels>, std::sync::Arc<SubtreeTransformContext>)>,
 }
@@ -5130,6 +5131,18 @@ impl Window {
     /// to determine whether the inserted hitbox was the topmost.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
+    /// Insert a hitbox with a retained host identity independent of cached-view paths.
+    pub fn insert_hover_hitbox(
+        &mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior,
+        owner: Option<(EntityId, u64)>,
+    ) -> Hitbox {
+        let mut hitbox = self.insert_hitbox(bounds, behavior);
+        hitbox.hover_owner = owner;
+        self.next_frame.hitboxes.last_mut().unwrap().hover_owner = owner;
+        hitbox
+    }
+
+    /// Insert a rectangular hitbox using the current content mask.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
@@ -5147,6 +5160,7 @@ impl Window {
             content_mask,
             behavior,
             identity,
+            hover_owner: None,
             subtree_geometry: self.subtree_geometry(),
             transform_base: None,
         };

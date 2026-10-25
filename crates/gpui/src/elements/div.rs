@@ -734,6 +734,12 @@ impl Interactivity {
 /// A trait for elements that want to use the standard GPUI event handlers that don't
 /// require any state.
 pub trait InteractiveElement: Sized {
+    /// Keep hover ownership stable when a retained host changes cached-view paths.
+    fn hover_owner(mut self, renderer: crate::EntityId, host: u64) -> Self {
+        self.interactivity().hover_owner = Some((renderer, host));
+        self
+    }
+
     /// Retrieve the interactivity state associated with this element
     fn interactivity(&mut self) -> &mut Interactivity;
 
@@ -2068,6 +2074,7 @@ pub(crate) struct AriaProperties {
 /// interactivity in the `Div` element.
 #[derive(Default)]
 pub struct Interactivity {
+    pub(crate) hover_owner: Option<(crate::EntityId, u64)>,
     /// The element ID of the element. In id is required to support a stateful subset of the interactivity such as on_click.
     pub element_id: Option<ElementId>,
     /// Whether the element was clicked. This will only be present after layout.
@@ -2321,7 +2328,7 @@ impl Interactivity {
                         overflow_mask,
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                Some(window.insert_hover_hitbox(bounds, self.hitbox_behavior, self.hover_owner))
                             } else {
                                 None
                             };
