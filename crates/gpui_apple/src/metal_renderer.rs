@@ -416,6 +416,32 @@ impl MetalRenderer {
         }
     }
 
+    /// Kybern: release the path target (recreated when a scene next has
+    /// paths), the cached instance buffers (a grown pool restarts at its
+    /// default size), the backdrop scratch and the passive region target.
+    /// `recreate_queue` also replaces the command queue, whose driver-side
+    /// pools otherwise keep their high-water size. In-flight command buffers
+    /// retain what they use (and their queue). Returns bytes released.
+    pub fn release_idle_resources(&mut self, recreate_queue: bool) -> u64 {
+        let texture_bytes = |texture: &Option<metal::Texture>| texture.as_ref().map_or(0, |t| t.width() * t.height() * 4);
+        let mut released = texture_bytes(&self.path_intermediate_texture);
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+        if let Some(resources) = &mut self.backdrop_resources {
+            released += texture_bytes(&resources.scratch);
+            resources.scratch = None;
+        }
+        self.release_passive_region_target();
+        let mut pool = self.instance_buffer_pool.lock();
+        released += pool.buffers.iter().map(|buffer| buffer.length()).sum::<u64>();
+        pool.reset(InstanceBufferPool::default().buffer_size);
+        drop(pool);
+        if recreate_queue {
+            self.command_queue = self.device.new_command_queue();
+        }
+        released
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         self.release_passive_region_target();
         if let Some(layer) = &self.layer {
@@ -505,6 +531,12 @@ impl MetalRenderer {
         } else { self.draw_with_frame_pool_inner(scene); }
     }
     fn draw_with_frame_pool_inner(&mut self, scene: &Scene) {
+        if self.path_intermediate_texture.is_none() && !scene.paths.is_empty() {
+            if let Some(layer) = &self.layer {
+                let drawable: NSSize = unsafe { msg_send![layer.as_ref(), drawableSize] };
+                self.update_path_intermediate_textures(size(DevicePixels(drawable.width as i32), DevicePixels(drawable.height as i32)));
+            }
+        }
         static REGION_LAYERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *REGION_LAYERS.get_or_init(||std::env::var("KYBERN_REGION_LAYERS").as_deref()==Ok("1")) && (self.has_passive_region_layers() || (Self::passive_region_enabled() && scene.has_native_paint_animation() && scene.paths.is_empty() && scene.backdrops.is_empty() && scene.surfaces.is_empty())) {
             unsafe {let _: ()=msg_send![objc::class!(CATransaction),begin];let _: ()=msg_send![objc::class!(CATransaction),setDisableActions:YES];}

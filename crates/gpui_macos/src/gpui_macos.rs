@@ -59,6 +59,32 @@ pub use text_system::MacTextSystem;
 
 pub use display_link::set_frame_wake_hook;
 pub use platform::MacPlatform;
+static WINDOW_STATE_OBSERVER: std::sync::RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = std::sync::RwLock::new(None);
+/// Install a nonblocking notification for window occlusion, key, move, screen,
+/// appearance and accessibility-display changes (embedded hosts re-read state).
+pub fn set_window_state_observer(observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    if observer.is_some() {
+        static ACCESSIBILITY: std::sync::Once = std::sync::Once::new();
+        // Reduce transparency, increase contrast and reduce motion change in
+        // System Settings while this app may not be key. Registered once; the
+        // block lives as long as the process.
+        ACCESSIBILITY.call_once(|| unsafe {
+            use cocoa::{base::{id, nil}, foundation::NSString};
+            use objc::{class, msg_send, sel, sel_impl};
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let center: id = msg_send![workspace, notificationCenter];
+            let name = NSString::alloc(nil).init_str("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
+            let block = block::ConcreteBlock::new(|_: id| notify_window_state()).copy();
+            let _: id = msg_send![center, addObserverForName: name object: nil queue: nil usingBlock: &*block];
+            std::mem::forget(block);
+        });
+    }
+    *WINDOW_STATE_OBSERVER.write().unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+}
+pub(crate) fn notify_window_state() {
+    let observer = WINDOW_STATE_OBSERVER.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if let Some(observer) = observer { observer(); }
+}
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

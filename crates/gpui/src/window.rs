@@ -4989,6 +4989,11 @@ impl Window {
         self.text_system().layout_memory_stats()
     }
 
+    /// Kybern: release GPU memory this window's next frame can rebuild.
+    pub fn release_idle_gpu_memory(&self, recreate_queue: bool) -> u64 {
+        self.platform_window.release_idle_gpu_memory(recreate_queue)
+    }
+
     pub fn element_arena_memory_bytes(&self) -> usize {
         ELEMENT_ARENA.with(|arena| arena.borrow().capacity())
     }

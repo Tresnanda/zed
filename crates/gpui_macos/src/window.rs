@@ -1832,6 +1832,10 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().moved_callback = Some(callback);
     }
 
+    fn release_idle_gpu_memory(&self, recreate_queue: bool) -> u64 {
+        self.0.as_ref().lock().renderer.release_idle_resources(recreate_queue)
+    }
+
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.as_ref().lock().should_close_callback = Some(callback);
     }
@@ -2719,6 +2723,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.renderer.release_passive_region_target();
         }
     }
+    crate::notify_window_state();
 }
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
@@ -2766,6 +2771,7 @@ pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bo
 }
 
 extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
+    crate::notify_window_state();
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     if let Some(mut callback) = lock.moved_callback.take() {
@@ -2802,6 +2808,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
 }
 
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
+    crate::notify_window_state();
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.start_display_link();
@@ -2810,6 +2817,7 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
 }
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
+    crate::notify_window_state();
     let window_state = unsafe { get_window_state(this) };
     let lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
@@ -3172,6 +3180,7 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
+    crate::notify_window_state();
     unsafe {
         let state = get_window_state(this);
         let appearance_changed_callback = {
