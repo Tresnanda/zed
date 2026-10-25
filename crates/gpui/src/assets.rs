@@ -84,7 +84,7 @@ impl RenderImage {
     /// Create a single-frame image from tightly packed BGRA pixels.
     pub fn from_bgra(width: u32, height: u32, bytes: Vec<u8>) -> Option<Self> {
         let buffer = image::RgbaImage::from_raw(width, height, bytes)?;
-        Some(Self::new(SmallVec::from_elem(Frame::new(buffer), 1)))
+        Some(Self::new(if image_frame_move_enabled() { SmallVec::from_buf([Frame::new(buffer)]) } else { SmallVec::from_elem(Frame::new(buffer), 1) }))
     }
 
     /// Convert this image into a byte slice.
@@ -153,9 +153,18 @@ mod tests {
     #[test]
     fn constructs_an_image_from_bgra_bytes() {
         let bytes = vec![0x10, 0x20, 0x30, 0xff, 0xaa, 0xbb, 0xcc, 0xff];
-        let image = RenderImage::from_bgra(2, 1, bytes.clone()).expect("valid BGRA image");
+        let expected = bytes.clone();
+        let buffer_ptr = bytes.as_ptr();
+        let image = RenderImage::from_bgra(2, 1, bytes).expect("valid BGRA image");
+        assert_eq!(image.as_bytes(0).unwrap().as_ptr(), buffer_ptr, "RenderImage must take ownership without copying pixels");
         assert_eq!(image.size(0), size(DevicePixels(2), DevicePixels(1)));
-        assert_eq!(image.as_bytes(0), Some(bytes.as_slice()));
+        assert_eq!(image.as_bytes(0), Some(expected.as_slice()));
         assert!(RenderImage::from_bgra(2, 1, vec![0; 4]).is_none());
     }
+}
+
+// Same-binary allocation-copy control; normal paints share Arc<RenderImage>.
+pub(crate) fn image_frame_move_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("KYBERN_IMAGE_FRAME_MOVE").as_deref() != Ok("0"))
 }

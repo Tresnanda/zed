@@ -2637,7 +2637,7 @@ pub(crate) fn decode_static_image_from_decoder(
         pixel.swap(0, 2);
     }
 
-    Ok(SmallVec::from_elem(Frame::new(data), 1))
+    Ok(if crate::assets::image_frame_move_enabled() { SmallVec::from_buf([Frame::new(data)]) } else { SmallVec::from_elem(Frame::new(data), 1) })
 }
 
 impl Hash for Image {
