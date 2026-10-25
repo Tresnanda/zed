@@ -161,7 +161,10 @@ impl Scene {
             }
         }
         if let Some(tag) = self.active_repaint_tag {
-            self.repaint_tags.insert(self.paint_operations.len(), tag);
+            // Selection washes and other decoration keep their own colors.
+            if tag.1 != 2 || matches!(&primitive, Primitive::MonochromeSprite(_) | Primitive::SubpixelSprite(_)) {
+                self.repaint_tags.insert(self.paint_operations.len(), tag);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -193,11 +196,13 @@ impl Scene {
             if !colors.contains_key(&id) { continue; }
             let valid = matches!((&self.paint_operations[index], kind),
                 (PaintOperation::Primitive(Primitive::Quad(_)), 0) |
-                (PaintOperation::Primitive(Primitive::MonochromeSprite(_)), 1));
+                (PaintOperation::Primitive(Primitive::MonochromeSprite(_)), 1 | 2) |
+                (PaintOperation::Primitive(Primitive::SubpixelSprite(_)), 2));
             let Some(&(slot_kind, slot)) = self.repaint_slots.get(&index) else { return false; };
-            if !valid || slot_kind != kind || match kind {
+            if !valid || (slot_kind != kind && !(kind == 2 && slot_kind == 3)) || match slot_kind {
                 0 => slot >= self.quads.len(),
-                1 => slot >= self.monochrome_sprites.len(),
+                1 | 2 => slot >= self.monochrome_sprites.len(),
+                3 => slot >= self.subpixel_sprites.len(),
                 _ => true,
             } { return false; }
             found.insert(id);
@@ -217,9 +222,13 @@ impl Scene {
                     quad.background = color.into();
                     self.quads[self.repaint_slots[&index].1].background = quad.background;
                 },
-                (PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)), 1) => {
+                (PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)), 1 | 2) => {
                     sprite.color = color;
                     self.monochrome_sprites[self.repaint_slots[&index].1].color = color;
+                },
+                (PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)), 2) => {
+                    sprite.color=color;
+                    self.subpixel_sprites[self.repaint_slots[&index].1].color=color;
                 },
                 _ => unreachable!("validated above"),
             }
@@ -258,20 +267,26 @@ impl Scene {
         if !self.repaint_tags.is_empty() {
             let mut quads = Vec::new();
             let mut sprites = Vec::new();
+            let mut subpixel = Vec::new();
             for (index, operation) in self.paint_operations.iter().enumerate() {
                 match operation {
                     PaintOperation::Primitive(Primitive::Quad(q)) => quads.push((index, q.order)),
                     PaintOperation::Primitive(Primitive::MonochromeSprite(p)) => sprites.push((index, (p.order, p.tile.tile_id))),
+                    PaintOperation::Primitive(Primitive::SubpixelSprite(p)) => subpixel.push((index,(p.order,p.tile.tile_id))),
                     _ => {},
                 }
             }
             quads.sort_by_key(|(_, order)| *order);
             sprites.sort_by_key(|(_, order)| *order);
+            subpixel.sort_by_key(|(_, order)| *order);
             for (slot, (index, _)) in quads.into_iter().enumerate() {
                 if self.repaint_tags.contains_key(&index) { self.repaint_slots.insert(index, (0, slot)); }
             }
             for (slot, (index, _)) in sprites.into_iter().enumerate() {
-                if self.repaint_tags.contains_key(&index) { self.repaint_slots.insert(index, (1, slot)); }
+                if self.repaint_tags.contains_key(&index) { self.repaint_slots.insert(index, (self.repaint_tags[&index].1, slot)); }
+            }
+            for (slot,(index,_)) in subpixel.into_iter().enumerate() {
+                if self.repaint_tags.contains_key(&index) { self.repaint_slots.insert(index,(3,slot)); }
             }
         }
         self.backdrops.sort_by_key(|b| b.order);
@@ -1127,11 +1142,12 @@ pub struct PaintAnimation {
     pub cycle_ms: f64,
     pub delay_ms: f64,
     pub breathe: bool,
+    pub shimmer: bool,
     pub started: std::time::Instant,
 }
 impl PaintAnimation {
     pub(crate) fn same_config(self, other: Self) -> bool {
-        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe
+        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer
     }
     fn opacity(self, now: std::time::Instant) -> f32 {
         let elapsed = now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
@@ -1143,7 +1159,8 @@ impl PaintAnimation {
             for _ in 0..16 { let mid=(lo+hi)*0.5; if bez(mid,0.42,0.58)<x {lo=mid;} else {hi=mid;} }
             bez((lo+hi)*0.5,0.0,1.0)
         }
-        (if self.breathe { 1.0 - 0.55*ease(if phase<0.5 {phase*2.0} else {2.0-phase*2.0}) }
+        (if self.shimmer { 1.0 + 0.6*ease(if phase<0.5 {phase*2.0} else {2.0-phase*2.0}) }
+        else if self.breathe { 1.0 - 0.55*ease(if phase<0.5 {phase*2.0} else {2.0-phase*2.0}) }
         else if phase<0.15 { 0.22 + 0.78*ease(phase/0.15) }
         else if phase<0.45 { 1.0 - 0.78*ease((phase-0.15)/0.3) }
         else { 0.22 }) as f32
@@ -1160,7 +1177,15 @@ impl Scene {
         let mut seen = std::collections::HashSet::new();
         let updates: Vec<_> = self.repaint_tags.values().filter_map(|&(id, _, _, animation, color)| {
             if animation.is_none() || !seen.insert(id) { return None; }
-            animation.map(|animation| (id, color.opacity(animation.opacity(now))))
+            animation.map(|animation| {
+                // Freeze only when explicitly requested by pixel comparisons.
+                static PHASE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+                let phase = *PHASE.get_or_init(|| std::env::var("KYBERN_PAINT_PHASE_MS").ok().and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite() && *v>=0.0));
+                let at = phase.map_or(now, |ms|animation.started + std::time::Duration::from_secs_f64(ms/1000.0));
+                let mut next = color;
+                next.a = (color.a * animation.opacity(at)).clamp(0.0,1.0);
+                (id,next)
+            })
         }).collect();
         !updates.is_empty() && self.repaint_tagged_inner(&updates, false)
     }
