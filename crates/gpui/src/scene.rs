@@ -279,6 +279,7 @@ impl Scene {
         }
         if found.len() != colors.len() { return false; }
         let pop_centres = self.pop_centres();
+        let band_spans = self.band_spans();
         for (&index, &(id, kind, inherited_opacity, animation, _)) in &self.repaint_tags {
             let Some(color) = colors.get(&id) else { continue; };
             let color = color.opacity(inherited_opacity);
@@ -304,6 +305,14 @@ impl Scene {
                             self.monochrome_sprites[self.repaint_slots[&index].1].transformation = grow;
                         }
                     }
+                    if let (Some(animation), Some(highlight)) = (animation, animation.and_then(|a| a.band)) {
+                        if let Some(&(x0, x1)) = band_spans.get(&id) {
+                            let u = (sprite.bounds.origin.x.0 + sprite.bounds.size.width.0 / 2.0 - x0) / (x1 - x0).max(1.0);
+                            let tint = shimmer_band_mix(color, highlight.opacity(inherited_opacity), shimmer_band_weight(u, animation.phase(paint_animation_clock(animation))));
+                            sprite.color = tint;
+                            self.monochrome_sprites[self.repaint_slots[&index].1].color = tint;
+                        }
+                    }
                     if let Some(animation) = animation.filter(|animation| animation.rotate) {
                         let centre = Point::new(ScaledPixels(sprite.bounds.origin.x.0 + sprite.bounds.size.width.0 / 2.0), ScaledPixels(sprite.bounds.origin.y.0 + sprite.bounds.size.height.0 / 2.0));
                         let turn = TransformationMatrix::unit().translate(centre).rotate(Radians(animation.angle(paint_animation_clock(animation)))).translate(Point::new(ScaledPixels(-centre.x.0), ScaledPixels(-centre.y.0)));
@@ -314,6 +323,14 @@ impl Scene {
                 (PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)), 2) => {
                     sprite.color=color;
                     self.subpixel_sprites[self.repaint_slots[&index].1].color=color;
+                    if let (Some(animation), Some(highlight)) = (animation, animation.and_then(|a| a.band)) {
+                        if let Some(&(x0, x1)) = band_spans.get(&id) {
+                            let u = (sprite.bounds.origin.x.0 + sprite.bounds.size.width.0 / 2.0 - x0) / (x1 - x0).max(1.0);
+                            let tint = shimmer_band_mix(color, highlight.opacity(inherited_opacity), shimmer_band_weight(u, animation.phase(paint_animation_clock(animation))));
+                            sprite.color = tint;
+                            self.subpixel_sprites[self.repaint_slots[&index].1].color = tint;
+                        }
+                    }
                     if let Some(animation) = animation.filter(|animation| animation.pop) {
                         if let Some(&(cx, cy)) = pop_centres.get(&id) {
                             let scale = animation.pop_state(paint_animation_clock(animation)).1;
@@ -1243,14 +1260,18 @@ pub struct PaintAnimation {
     pub shimmer: bool,
     pub rotate: bool,
     pub pop: bool,
+    /// A true shimmer: the highlight band's colour (with `shimmer`).
+    pub band: Option<Hsla>,
+    /// A hue loop: one turn of the colour wheel per cycle, saturated 1.2.
+    pub hue: bool,
     pub started: std::time::Instant,
 }
 impl PaintAnimation {
     pub(crate) fn same_config(self, other: Self) -> bool {
-        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer && self.rotate == other.rotate && self.pop == other.pop
+        self.cycle_ms == other.cycle_ms && self.delay_ms == other.delay_ms && self.breathe == other.breathe && self.shimmer == other.shimmer && self.rotate == other.rotate && self.pop == other.pop && self.band == other.band && self.hue == other.hue
     }
     fn opacity(self, now: std::time::Instant) -> f32 {
-        if self.rotate { return 1.0; }
+        if self.rotate || self.band.is_some() || self.hue { return 1.0; }
         if self.pop { return self.pop_state(now).0; }
         let elapsed = now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
         if elapsed < 0.0 { return if self.breathe { 1.0 } else { 0.22 }; }
@@ -1333,6 +1354,10 @@ impl Scene {
                 let at = phase.map_or(now, |ms|animation.started + std::time::Duration::from_secs_f64(ms/1000.0));
                 let mut next = color;
                 next.a = (color.a * animation.opacity(at)).clamp(0.0,1.0);
+                if animation.hue {
+                    next.h = (next.h + animation.phase(at) as f32).fract();
+                    next.s = (next.s * 1.2).min(1.0);
+                }
                 (id,next)
             })
         }).collect();
@@ -1398,6 +1423,9 @@ pub struct CompositorLoop {
     pub breathe: bool,
     pub shimmer: bool,
     pub rotate: bool,
+    /// A banded shimmer's highlight and this glyph's position across its label (0..1).
+    pub band: Option<Hsla>,
+    pub band_u: f32,
     pub started: std::time::Instant,
 }
 /// Whether stable passive loops may run in the compositor (`KYBERN_COMPOSITOR_LOOPS=0` disables).
@@ -1452,6 +1480,7 @@ impl Scene {
     /// One candidate per primitive of an eligible leaf; a leaf with any ineligible primitive stays in the scene.
     fn compositor_part(&self, index: usize, kind: u8, a: crate::PaintAnimation) -> Result<(Bounds<ScaledPixels>, ContentMask<ScaledPixels>, f32, Option<AtlasTile>), &'static str> {
         if a.pop { return Err("pop"); }
+        if a.hue { return Err("hue"); }
         if self.stroke_tags.contains_key(&index) || self.fade_tags.contains_key(&index) { return Err("stroke or fade"); }
         // A resting press/pop scope (identity paint, opacity 1, no blur) and a translation scope are fine:
         // any movement changes the leaf's bounds, which hands it back to the scene.
@@ -1491,7 +1520,7 @@ impl Scene {
                     clip = node.parent;
                 }
                 Ok(CompositorLoop { id, part: 0, bounds: b, radius, color: color.opacity(inherited), tile, cycle_ms: a.cycle_ms, delay_ms: a.delay_ms,
-                    breathe: a.breathe, shimmer: a.shimmer, rotate: a.rotate, started: a.started })
+                    breathe: a.breathe, shimmer: a.shimmer, rotate: a.rotate, band: a.band.map(|h| h.opacity(inherited)), band_u: 0., started: a.started })
             });
             match part {
                 Ok(l) => parts.entry(id).or_default().push((index, l)),
@@ -1501,6 +1530,10 @@ impl Scene {
         let mut found: Vec<(usize, CompositorLoop)> = Vec::new();
         for (_, mut leaf) in parts {
             leaf.sort_by_key(|(index, _)| *index);
+            if leaf.first().is_some_and(|(_, l)| l.band.is_some()) {
+                let (x0, x1) = leaf.iter().fold((f32::MAX, f32::MIN), |(a, b), (_, l)| (a.min(l.bounds.origin.x.0), b.max(l.bounds.origin.x.0 + l.bounds.size.width.0)));
+                for (_, l) in &mut leaf { l.band_u = (l.bounds.origin.x.0 + l.bounds.size.width.0 / 2.0 - x0) / (x1 - x0).max(1.0); }
+            }
             for (n, (index, mut l)) in leaf.into_iter().enumerate() { l.part = n as u32; found.push((index, l)); }
         }
         if debug { eprintln!("[compositor-loops] tagged={} candidates={}", self.repaint_tags.values().filter(|t| t.3.is_some()).count(), found.len()); }
@@ -1563,5 +1596,46 @@ impl Scene {
         self.compositor_ids.extend(ids);
         self.compositor_loops.extend(promote);
         true
+    }
+}
+
+impl PaintAnimation {
+    /// Fraction of the current cycle at `at` (0 during the delay).
+    pub(crate) fn phase(self, at: std::time::Instant) -> f64 {
+        let elapsed = at.saturating_duration_since(self.started).as_secs_f64() * 1000.0 - self.delay_ms;
+        if elapsed <= 0.0 || self.cycle_ms <= 0.0 { 0.0 } else { (elapsed % self.cycle_ms) / self.cycle_ms }
+    }
+}
+/// The shimmer band's weight at `u` (0 at the label's left edge, 1 at its right) and cycle `phase`: the band's centre
+/// travels from one label width left of it to two widths right (`background-position: 100% -> 0%` of a 400% gradient),
+/// fading linearly over 0.4 widths each side of the centre.
+pub fn shimmer_band_weight(u: f32, phase: f64) -> f32 {
+    let centre = -1.0 + 3.0 * phase as f32;
+    (1.0 - (u - centre).abs() / 0.4).max(0.0)
+}
+/// The base text with the band's highlight over it at `weight` (source-over of an opaque highlight at that alpha).
+pub fn shimmer_band_mix(base: Hsla, highlight: Hsla, weight: f32) -> Hsla {
+    let (b, h) = (crate::Rgba::from(base), crate::Rgba::from(highlight));
+    let w = (weight * h.a).clamp(0.0, 1.0);
+    let a = w + b.a * (1.0 - w);
+    if a <= 0.0 { return base; }
+    let mix = |x: f32, y: f32| (y * w + x * b.a * (1.0 - w)) / a;
+    Hsla::from(crate::Rgba { r: mix(b.r, h.r), g: mix(b.g, h.g), b: mix(b.b, h.b), a })
+}
+impl Scene {
+    /// The horizontal extent of every banded shimmer leaf: the union of its glyph sprites.
+    fn band_spans(&self) -> std::collections::HashMap<u64, (f32, f32)> {
+        let mut spans: std::collections::HashMap<u64, (f32, f32)> = std::collections::HashMap::new();
+        for (&index, &(id, _, _, animation, _)) in &self.repaint_tags {
+            if !animation.is_some_and(|a| a.band.is_some()) { continue; }
+            let b = match &self.paint_operations[index] {
+                PaintOperation::Primitive(Primitive::MonochromeSprite(p)) => p.bounds,
+                PaintOperation::Primitive(Primitive::SubpixelSprite(p)) => p.bounds,
+                _ => continue,
+            };
+            let e = spans.entry(id).or_insert((b.origin.x.0, b.origin.x.0 + b.size.width.0));
+            e.0 = e.0.min(b.origin.x.0); e.1 = e.1.max(b.origin.x.0 + b.size.width.0);
+        }
+        spans
     }
 }
