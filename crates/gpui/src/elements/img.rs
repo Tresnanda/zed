@@ -1008,3 +1008,11 @@ mod tests {
         });
     }
 }
+
+impl ImageSource {
+    /// Kybern: `Some(true)` once the source has decoded, `Some(false)` if it failed, `None` while it loads (this
+    /// registers the window for a redraw when it lands, like `Img` does).
+    pub fn kybern_loaded(&self, window: &mut Window, cx: &mut App) -> Option<bool> {
+        self.use_data(None, window, cx).map(|result| result.is_ok())
+    }
+}
