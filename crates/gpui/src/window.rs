@@ -1160,6 +1160,7 @@ const KEYBOARD_MODALITY_MOUSE_SLOP: Pixels = px(8.);
 
 /// Holds the state for a specific window.
 pub struct Window {
+    kybern_motion_frame_epoch: u64,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
@@ -1863,6 +1864,7 @@ impl Window {
         platform_window.map_window().unwrap();
 
         Ok(Window {
+            kybern_motion_frame_epoch: 0,
             handle,
             invalidator,
             removed: false,
@@ -2988,10 +2990,13 @@ impl Window {
         self.capslock
     }
 
+    pub fn kybern_motion_frame_epoch(&self) -> u64 { self.kybern_motion_frame_epoch }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.kybern_motion_frame_epoch = self.kybern_motion_frame_epoch.wrapping_add(1);
         static COST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let kybern_started = COST.get_or_init(|| std::env::var_os("KYBERN_FRAME_COSTS").is_some()).then(std::time::Instant::now);
         if kybern_started.is_some() { KYBERN_LAYOUT_NS.set(0); KYBERN_LAYOUT_CALLS.set(0); }
