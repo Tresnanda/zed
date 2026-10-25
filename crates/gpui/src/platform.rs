@@ -96,6 +96,48 @@ pub use threaded_dispatcher::ThreadedDispatcher;
 ))]
 pub use visual_test::VisualTestPlatform;
 
+/// Kybern: the frame wake hook off macOS, where the platform's own frame source
+/// (Wayland frame callbacks, the X11 refresh loop, the Windows DWM vsync thread)
+/// drives frames on the UI thread. macOS has the display link's hook instead.
+#[cfg(not(target_os = "macos"))]
+static FRAME_WAKE_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(not(target_os = "macos"))]
+static SERVED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Kybern: call `hook` on the UI thread after each frame request that drew the
+/// window or ran next-frame callbacks. Idle requests (nothing dirty, nothing
+/// scheduled) do not call it, so the hook is silent while nothing changes.
+#[cfg(not(target_os = "macos"))]
+pub fn set_frame_wake_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    let previous = {
+        let mut current = FRAME_WAKE_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *current, hook)
+    };
+    drop(previous);
+}
+
+/// Kybern: frame requests that drew or ran next-frame callbacks, since launch.
+#[cfg(not(target_os = "macos"))]
+pub fn served_frame_count() -> u64 {
+    SERVED_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn frame_served() {
+    SERVED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let hook = FRAME_WAKE_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 // TODO(jk): return an enum instead of a string
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor.

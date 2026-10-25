@@ -1670,6 +1670,8 @@ impl Window {
                 last_frame_time.set(Some(now));
 
                 let pending_next_frame_callbacks = next_frame_callbacks.take();
+                #[cfg(not(target_os = "macos"))]
+                let mut served = !pending_next_frame_callbacks.is_empty();
                 if !pending_next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
@@ -1688,6 +1690,10 @@ impl Window {
                     || input_rate_tracker.borrow_mut().is_high_rate();
 
                 if invalidator.is_dirty() || force_render {
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        served = true;
+                    }
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1725,6 +1731,11 @@ impl Window {
                 // source explicitly.
                 if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
                     invalidator.wake_platform();
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                if served {
+                    crate::platform::frame_served();
                 }
             }
         }));
