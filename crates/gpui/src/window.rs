@@ -2030,6 +2030,35 @@ impl Window {
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
+    /// Tag passive leaf paint for a subsequent geometry-preserving update.
+    pub fn with_repaint_tag<R>(&mut self, id: u64, kind: u8, animation: Option<crate::PaintAnimation>, color: crate::Hsla, paint: impl FnOnce(&mut Self) -> R) -> R {
+        let animation = animation.map(|mut animation| {
+            if let Some(previous) = self.rendered_frame.scene.animation_for(id) {
+                if animation.same_config(previous) { animation.started = previous.started; }
+            }
+            animation
+        });
+        let tag = (id, kind, self.element_opacity(), animation, color);
+        let previous = self.next_frame.scene.active_repaint_tag.replace(tag);
+        let result = paint(self);
+        self.next_frame.scene.active_repaint_tag = previous;
+        result
+    }
+
+    /// Present updated leaf paint without invalidating view/layout caches.
+    /// Returns false for missing, clipped or unsupported paint, so callers can
+    /// use their normal full invalidation path. Metal still presents the scene.
+    pub fn repaint_tagged(&mut self, updates: &[(u64, crate::Hsla)]) -> bool {
+        if !self.invalidator.not_drawing() || !self.rendered_frame.scene.repaint_tagged(updates) { return false; }
+        self.needs_present.set(true);
+        // Demand-driven platforms stop their display source when there are no
+        // dirty views or frame callbacks. Keep one callback pending so a paint-
+        // only request cannot be dropped as the previous frame goes idle.
+        self.on_next_frame(|window, _| window.needs_present.set(true));
+        true
+    }
+
+    /// Mark the window dirty and bypass view caches on the next frame.
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
