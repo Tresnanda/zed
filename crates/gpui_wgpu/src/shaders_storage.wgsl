@@ -40,3 +40,36 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return b_poly_sprites[instance_id];
 }
+
+// Kybern: the scene's rounded clip chains (rounded_clip_gpui.py), shared by every pipeline.
+@group(1) @binding(1) var<storage, read> b_rounded_clips: array<RoundedClipNode>;
+
+// Coverage of `p` inside rounded chain `id` (0 = rectangular): interior pixels
+// take comparisons only; corner pixels evaluate one circle distance per link.
+fn rounded_clip_alpha(p: vec2<f32>, chain: u32) -> f32 {
+    var id = chain;
+    var coverage = 1.0;
+    loop {
+        if (id == 0u || id >= arrayLength(&b_rounded_clips)) {
+            break;
+        }
+        let n = b_rounded_clips[id];
+        let lo = vec2<f32>(n.bounds[0], n.bounds[1]);
+        let size = vec2<f32>(n.bounds[2], n.bounds[3]);
+        let right = p.x >= lo.x + size.x / 2.0;
+        let bottom = p.y >= lo.y + size.y / 2.0;
+        var r = n.radii[0];
+        if (right && !bottom) { r = n.radii[1]; }
+        if (right && bottom) { r = n.radii[2]; }
+        if (!right && bottom) { r = n.radii[3]; }
+        let c = lo + vec2<f32>(select(r, size.x - r, right), select(r, size.y - r, bottom));
+        let q = vec2<f32>(select(c.x - p.x, p.x - c.x, right), select(c.y - p.y, p.y - c.y, bottom));
+        let distance = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        if (any(p < lo) || any(p >= lo + size) || distance >= 0.5) {
+            return 0.0;
+        }
+        coverage = min(coverage, saturate(0.5 - distance));
+        id = n.parent;
+    }
+    return coverage;
+}

@@ -27,6 +27,50 @@ struct Bounds {
     float2 size;
 };
 
+// Kybern: gpui's 24-byte ContentMask and its rounded chains (rounded_clip_gpui.py).
+struct ContentMask {
+    Bounds bounds;
+    uint rounded_clip;
+    uint clip_generation;
+};
+
+struct RoundedClipNode {
+    float4 bounds;
+    float4 radii;
+    uint parent;
+};
+
+StructuredBuffer<RoundedClipNode> rounded_clips: register(t2);
+
+// Coverage of `p` inside rounded chain `id` (0 = rectangular); see shaders.metal.
+// The shaders compile for ps_4_1, which has no structured-buffer GetDimensions:
+// every id indexes a chain written this frame, and links are capped at 64.
+float rounded_clip_alpha(float2 p, uint id) {
+    float coverage = 1.0;
+    [loop]
+    for (uint link = 0; link < 64 && id != 0; link++) {
+        RoundedClipNode n = rounded_clips[id];
+        float2 lo = n.bounds.xy;
+        float2 size = n.bounds.zw;
+        bool right = p.x >= lo.x + size.x / 2.0;
+        bool bottom = p.y >= lo.y + size.y / 2.0;
+        float r = bottom ? (right ? n.radii.z : n.radii.w) : (right ? n.radii.y : n.radii.x);
+        float2 c = lo + float2(right ? size.x - r : r, bottom ? size.y - r : r);
+        float2 q = float2(right ? p.x - c.x : c.x - p.x, bottom ? p.y - c.y : c.y - p.y);
+        float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+        if (any(p < lo) || any(p >= lo + size) || distance >= 0.5) {
+            return 0.0;
+        }
+        coverage = min(coverage, saturate(0.5 - distance));
+        id = n.parent;
+    }
+    return coverage;
+}
+
+float4 apply_rounded_clip(float4 color, float coverage) {
+    return float4(color.rgb, color.a * coverage);
+}
+
 struct Corners {
     float top_left;
     float top_right;
@@ -502,7 +546,7 @@ struct Quad {
     uint order;
     uint border_style;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Background background;
     Hsla border_color;
     Corners corner_radii;
@@ -542,7 +586,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
         quad.background.solid,
         quad.background.colors
     );
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
     float4 border_color = hsla_to_rgba(quad.border_color);
 
     QuadVertexOutput output;
@@ -572,7 +616,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return apply_rounded_clip(background_color, rounded_clip_alpha(input.position.xy, quads[input.quad_id].content_mask.rounded_clip));
     }
 
     float2 size = quad.bounds.size;
@@ -631,7 +675,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return apply_rounded_clip(background_color, rounded_clip_alpha(input.position.xy, quads[input.quad_id].content_mask.rounded_clip));
     }
 
     // Signed distance of the point to the outside edge of the quad's border
@@ -844,7 +888,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return apply_rounded_clip(color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf)), rounded_clip_alpha(input.position.xy, quads[input.quad_id].content_mask.rounded_clip));
 }
 
 /*
@@ -858,7 +902,7 @@ struct Shadow {
     float blur_radius;
     Bounds bounds;
     Corners corner_radii;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
@@ -898,7 +942,7 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id: 
     }
 
     float4 device_position = to_device_position(unit_vertex, bounds);
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
     float4 color = hsla_to_rgba(shadow.color);
 
     ShadowVertexOutput output;
@@ -950,7 +994,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return input.color * float4(1., 1., 1., alpha);
+    return apply_rounded_clip(input.color * float4(1., 1., 1., alpha), rounded_clip_alpha(input.position.xy, shadows[input.shadow_id].content_mask.rounded_clip));
 }
 
 /*
@@ -964,6 +1008,8 @@ struct PathRasterizationSprite {
     float2 st_position;
     Background color;
     Bounds bounds;
+    uint rounded_clip;
+    uint pad;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1016,7 +1062,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
     float4 color = gradient_color(background, input.position.xy, bounds,
         gradient.solid, gradient.color0, gradient.color1);
-    return float4(color.rgb * color.a * alpha, alpha * color.a);
+    return (float4(color.rgb * color.a * alpha, alpha * color.a)) * rounded_clip_alpha(input.position.xy, path_rasterization_sprites[input.vertex_id].rounded_clip);
 }
 
 /*
@@ -1066,7 +1112,7 @@ struct Underline {
     uint order;
     uint pad;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1093,7 +1139,7 @@ UnderlineVertexOutput underline_vertex(uint vertex_id: SV_VertexID, uint instanc
     Underline underline = underlines[underline_id];
     float4 device_position = to_device_position(unit_vertex, underline.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                    underline.content_mask);
+                                                    underline.content_mask.bounds);
     float4 color = hsla_to_rgba(underline.color);
 
     UnderlineVertexOutput output;
@@ -1125,9 +1171,9 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
         float distance_from_bottom_border = distance_in_pixels + half_thickness;
         float alpha = saturate(
             0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-        return input.color * float4(1., 1., 1., alpha);
+        return apply_rounded_clip(input.color * float4(1., 1., 1., alpha), rounded_clip_alpha(input.position.xy, underlines[input.underline_id].content_mask.rounded_clip));
     } else {
-        return input.color;
+        return apply_rounded_clip(input.color, rounded_clip_alpha(input.position.xy, underlines[input.underline_id].content_mask.rounded_clip));
     }
 }
 
@@ -1141,7 +1187,7 @@ struct MonochromeSprite {
     uint order;
     uint pad;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     AtlasTile tile;
     TransformationMatrix transformation;
@@ -1151,6 +1197,7 @@ struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation uint rounded_clip: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1158,6 +1205,7 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation uint rounded_clip: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1169,7 +1217,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     MonochromeSprite sprite = mono_sprites[sprite_id];
     float4 device_position =
         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
-    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
     float4 color = hsla_to_rgba(sprite.color);
 
@@ -1177,6 +1225,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.rounded_clip = sprite.content_mask.rounded_clip;
     output.clip_distance = clip_distance;
     return output;
 }
@@ -1184,7 +1233,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    return apply_rounded_clip(float4(input.color.rgb, input.color.a * alpha_corrected), rounded_clip_alpha(input.position.xy, input.rounded_clip));
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1200,7 +1249,7 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
     SubpixelSpriteFragmentOutput output;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    output.alpha = float4(input.color.a * alpha_corrected * rounded_clip_alpha(input.position.xy, input.rounded_clip), 1.0f);
     return output;
 }
 
@@ -1216,7 +1265,7 @@ struct PolychromeSprite {
     uint grayscale;
     float opacity;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Corners corner_radii;
     AtlasTile tile;
 };
@@ -1242,7 +1291,7 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     PolychromeSprite sprite = poly_sprites[sprite_id];
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                    sprite.content_mask);
+                                                    sprite.content_mask.bounds);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
 
     PolychromeSpriteVertexOutput output;
@@ -1271,5 +1320,5 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         color = float4(grayscale, sample.a);
     }
     color.a *= sprite.opacity * saturate(0.5 - distance);
-    return color;
+    return apply_rounded_clip(color, rounded_clip_alpha(input.position.xy, poly_sprites[input.sprite_id].content_mask.rounded_clip));
 }

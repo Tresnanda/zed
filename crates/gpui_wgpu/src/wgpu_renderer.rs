@@ -107,6 +107,8 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    rounded_clip: u32,
+    pad: u32,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -198,6 +200,10 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// Kybern: the current `Scene::rounded_clips` (storage transport only).
+    rounded_clips: Option<wgpu::Buffer>,
+    /// Bytes of it this frame uses (the binding size, so `arrayLength` is the chain count).
+    rounded_clips_size: u64,
 }
 
 /// Offscreen render target plus the buffer its pixels are copied into.
@@ -642,6 +648,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            rounded_clips: None,
+            rounded_clips_size: 0,
         };
 
         Ok(Self {
@@ -725,9 +733,21 @@ impl WgpuRenderer {
             count: None,
         };
 
+        // Kybern: the rounded clip chains sit next to every storage instance binding.
+        let rounded_clips_entry = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let instance_entries = [instance_data_entry, rounded_clips_entry];
         let instances = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("instances_layout"),
-            entries: &[instance_data_entry],
+            entries: if uses_webgl_instance_data { &instance_entries[..1] } else { &instance_entries[..] },
         });
 
         let texture = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1605,6 +1625,9 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        if !self.uses_webgl_instance_data {
+            self.write_rounded_clips(&scene.rounded_clips);
+        }
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1646,6 +1669,8 @@ impl WgpuRenderer {
 
             for batch in scene.batches() {
                 match batch {
+                    // Kybern: no backdrop filter here; the translucent fill above it still paints.
+                    PrimitiveBatch::Backdrop(_) => {}
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
                         &self.resources().pipelines.quads,
@@ -1968,6 +1993,8 @@ impl WgpuRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                rounded_clip: path.content_mask.rounded_clip,
+                pad: 0,
             }));
         }
 
@@ -2075,26 +2102,73 @@ impl WgpuRenderer {
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: match &resources.instance_data {
-                        InstanceData::Storage(buffer) => {
-                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer,
-                                offset,
-                                size: NonZeroU64::new(size),
-                            })
-                        }
-                        InstanceData::Texture { view, .. } => {
-                            wgpu::BindingResource::TextureView(view)
-                        }
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: match &resources.instance_data {
+                            InstanceData::Storage(buffer) => {
+                                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer,
+                                    offset,
+                                    size: NonZeroU64::new(size),
+                                })
+                            }
+                            InstanceData::Texture { view, .. } => {
+                                wgpu::BindingResource::TextureView(view)
+                            }
+                        },
                     },
-                }],
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: match &resources.rounded_clips {
+                            Some(buffer) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer,
+                                offset: 0,
+                                size: NonZeroU64::new(resources.rounded_clips_size),
+                            }),
+                            None => wgpu::BindingResource::TextureView(match &resources.instance_data {
+                                InstanceData::Texture { view, .. } => view,
+                                InstanceData::Storage(_) => unreachable!("rounded clips are written before any storage binding"),
+                            }),
+                        },
+                    },
+                ][..if resources.rounded_clips.is_some() { 2 } else { 1 }],
             });
         Ok(InstanceBinding {
             bind_group,
             first_instance,
         })
+    }
+
+    /// Kybern: upload the scene's rounded clip chains (at least one zero node,
+    /// since wgpu rejects empty bindings), growing the buffer by powers of two.
+    fn write_rounded_clips(&mut self, clips: &[gpui::RoundedClip]) {
+        let zero = [gpui::RoundedClip::default()];
+        // `KYBERN_ROUNDED_CLIP=0` keeps every chain but squares its corners: the
+        // rectangular clip the app had before this port (the before/after check).
+        let square: Vec<gpui::RoundedClip>;
+        let clips = if clips.is_empty() {
+            &zero[..]
+        } else if std::env::var("KYBERN_ROUNDED_CLIP").is_ok_and(|value| value == "0") {
+            square = clips.iter().map(|clip| gpui::RoundedClip { radii: [0.0; 4], ..*clip }).collect();
+            &square[..]
+        } else {
+            clips
+        };
+        let data = unsafe { Self::instance_bytes(clips) };
+        let resources = self.resources_mut();
+        let fits = resources.rounded_clips.as_ref().is_some_and(|buffer| buffer.size() >= data.len() as u64);
+        if !fits {
+            resources.rounded_clips = Some(resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rounded_clips"),
+                size: (data.len() as u64).next_power_of_two().max(1024),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        resources.rounded_clips_size = data.len() as u64;
+        let resources = self.resources();
+        resources.queue.write_buffer(resources.rounded_clips.as_ref().unwrap(), 0, data);
     }
 
     fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {

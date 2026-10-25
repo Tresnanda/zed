@@ -1442,7 +1442,7 @@ pub struct CompositorLoop {
 /// Whether stable passive loops may run in the compositor (`KYBERN_COMPOSITOR_LOOPS=0` disables).
 pub fn compositor_loops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("KYBERN_COMPOSITOR_LOOPS").as_deref() != Ok("0")
+    *ENABLED.get_or_init(|| cfg!(target_os = "macos") && std::env::var("KYBERN_COMPOSITOR_LOOPS").as_deref() != Ok("0")
         && std::env::var("KYBERN_SCOPED_BUFFERS").as_deref() != Ok("0")
         && std::env::var_os("KYBERN_PAINT_PHASE_MS").is_none())
 }

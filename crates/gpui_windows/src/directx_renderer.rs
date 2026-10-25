@@ -54,6 +54,8 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    /// Kybern: the scene's rounded clip chains (buffer, view, capacity in nodes).
+    rounded_clips: Option<(ID3D11Buffer, Option<ID3D11ShaderResourceView>, usize)>,
 }
 
 /// Direct3D objects
@@ -194,6 +196,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            rounded_clips: None,
         })
     }
 
@@ -323,6 +326,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.rounded_clips = None;
         self.skip_draws = true;
         Ok(())
     }
@@ -356,6 +360,7 @@ impl DirectXRenderer {
             _ => [0.0f32; 4],
         })?;
         self.upload_scene_buffers(scene)?;
+        self.upload_rounded_clips(&scene.rounded_clips)?;
 
         let annotation = self
             .devices
@@ -367,6 +372,8 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
+                // Kybern: no backdrop filter here; the translucent fill above it still paints.
+                PrimitiveBatch::Backdrop(_) => Ok(()),
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
@@ -526,6 +533,31 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Kybern: upload the rounded clip chains and bind them at t2 for every pass.
+    fn upload_rounded_clips(&mut self, clips: &[gpui::RoundedClip]) -> Result<()> {
+        let zero = [gpui::RoundedClip::default()];
+        let square: Vec<gpui::RoundedClip>;
+        let clips = if clips.is_empty() {
+            &zero[..]
+        } else if rounded_clips_disabled() {
+            square = clips.iter().map(|clip| gpui::RoundedClip { radii: [0.0; 4], ..*clip }).collect();
+            &square[..]
+        } else {
+            clips
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        if self.rounded_clips.as_ref().is_none_or(|(_, _, capacity)| *capacity < clips.len()) {
+            let capacity = clips.len().next_power_of_two().max(64);
+            let buffer = create_buffer(&devices.device, std::mem::size_of::<gpui::RoundedClip>(), capacity)?;
+            let view = create_buffer_view(&devices.device, &buffer)?;
+            self.rounded_clips = Some((buffer, view, capacity));
+        }
+        let (buffer, view, _) = self.rounded_clips.as_ref().unwrap();
+        update_buffer(&devices.device_context, buffer, clips)?;
+        unsafe { devices.device_context.PSSetShaderResources(2, Some(slice::from_ref(view))) };
+        Ok(())
+    }
+
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
 
@@ -641,6 +673,8 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                rounded_clip: path.content_mask.rounded_clip,
+                pad: 0,
             }));
         }
 
@@ -1267,6 +1301,8 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    rounded_clip: u32,
+    pad: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -2061,4 +2097,10 @@ mod dxgi {
             number & 0xFFFF
         ))
     }
+}
+
+/// Kybern: `KYBERN_ROUNDED_CLIP=0` squares every rounded clip (the before/after check).
+fn rounded_clips_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("KYBERN_ROUNDED_CLIP").is_ok_and(|value| value == "0"))
 }
