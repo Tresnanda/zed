@@ -4938,6 +4938,12 @@ impl Window {
     }
 
     /// Retained frame arena allocation capacity, after its last safe reset.
+    /// High water node count of the retained Taffy slot storage.
+    pub fn layout_memory_peak_nodes(&self) -> usize {
+        self.layout_engine.as_ref().map_or(0, |engine| engine.memory_peak_nodes())
+    }
+
+    /// Retained frame arena allocation capacity, after its last safe reset.
     pub fn element_arena_memory_bytes(&self) -> usize {
         ELEMENT_ARENA.with(|arena| arena.borrow().capacity())
     }

@@ -150,11 +150,25 @@ impl Arena {
     fn force_clear(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));
+        let used_elements = self.elements.len();
+        let used_chunks = self.current_chunk_index + 1;
         self.elements.clear();
         for chunk_index in 0..=self.current_chunk_index {
             self.chunks[chunk_index].reset();
         }
         self.current_chunk_index = 0;
+        static TRIM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRIM.get_or_init(|| std::env::var("KYBERN_FRAME_MEMORY").as_deref() != Ok("0")) {
+            // Destructors ran and all arena references were invalidated above.
+            // Keep 2x the current frame to avoid churning on small fluctuations.
+            let large_collapse = self.chunks.len() > 8 && used_chunks.saturating_mul(4) < self.chunks.len();
+            if large_collapse {
+                self.chunks.truncate(used_chunks.saturating_mul(2).max(2));
+            }
+            if self.elements.capacity() > 16384 && used_elements.saturating_mul(4) < self.elements.capacity() {
+                self.elements.shrink_to(used_elements.saturating_mul(2).max(1024));
+            }
+        }
     }
 
     #[inline(always)]
@@ -374,6 +388,24 @@ mod tests {
         arena.end_scope();
         arena.clear();
         assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn large_frame_capacity_returns_after_a_small_frame() {
+        let mut arena = Arena::new(1024);
+        for _ in 0..40 { arena.alloc(|| [0u8; 900]); }
+        let peak = arena.capacity();
+        assert!(peak > 32 * 1024);
+        arena.clear();
+        arena.begin_scope();
+        let value = arena.alloc(|| 42u64);
+        arena.clear(); // A nested clear must not trim live outer allocations.
+        assert_eq!(*value, 42);
+        arena.end_scope();
+        arena.clear();
+        assert!(arena.capacity() <= 2 * 1024);
+        let value = arena.alloc(|| 17u64);
+        assert_eq!(*value, 17);
     }
 
     #[test]

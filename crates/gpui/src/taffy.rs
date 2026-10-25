@@ -31,6 +31,7 @@ struct NodeContext {
 }
 include!("scroll_taffy.rs");
 pub struct TaffyLayoutEngine {
+    peak_nodes: usize,
     scroll_layouts: ScrollLayouts,
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -47,6 +48,7 @@ impl TaffyLayoutEngine {
         let mut taffy = TaffyTree::new();
         taffy.disable_rounding();
         TaffyLayoutEngine {
+            peak_nodes: 0,
             taffy,
             scroll_layouts: Default::default(),
             absolute_layout_bounds: FxHashMap::default(),
@@ -56,9 +58,26 @@ impl TaffyLayoutEngine {
         }
     }
 
+    pub(crate) fn memory_peak_nodes(&self) -> usize { self.peak_nodes }
+
     pub fn clear(&mut self) {
         self.scroll_layouts.next_frame();
-        self.taffy.clear();
+        let nodes = self.taffy.total_node_count();
+        self.peak_nodes = self.peak_nodes.max(nodes);
+        static TRIM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRIM.get_or_init(|| std::env::var("KYBERN_FRAME_MEMORY").as_deref() != Ok("0"))
+            && self.peak_nodes > 4096 && nodes.saturating_mul(8) < self.peak_nodes {
+            // TaffyTree::clear drops nodes but keeps its SlotMap backing at the
+            // largest document ever laid out. No LayoutId survives this clear.
+            self.taffy = TaffyTree::with_capacity(nodes.saturating_mul(2).max(256));
+            self.taffy.disable_rounding();
+            self.peak_nodes = nodes;
+            self.absolute_layout_bounds.shrink_to(nodes.saturating_mul(2).max(256));
+            self.absolute_outer_origins.shrink_to(nodes.saturating_mul(2).max(256));
+            self.computed_layouts.shrink_to(nodes.saturating_mul(2).max(256));
+        } else {
+            self.taffy.clear();
+        }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
