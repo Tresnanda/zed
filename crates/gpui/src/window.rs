@@ -2949,6 +2949,9 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        static COST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let kybern_started = COST.get_or_init(|| std::env::var_os("KYBERN_FRAME_COSTS").is_some()).then(std::time::Instant::now);
+        if kybern_started.is_some() { KYBERN_LAYOUT_NS.set(0); KYBERN_LAYOUT_CALLS.set(0); }
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3088,6 +3091,9 @@ impl Window {
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
+        if let Some(started) = kybern_started {
+            eprintln!("[kybern-work] renderMs={:.3} layoutMs={:.3} layoutCalls={}", started.elapsed().as_secs_f64()*1000.0, KYBERN_LAYOUT_NS.get() as f64 / 1e6, KYBERN_LAYOUT_CALLS.get());
+        }
         arena_scope.exit(&cx.element_arena)
     }
 
@@ -4967,9 +4973,15 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
 
+        static COST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let kybern_started = COST.get_or_init(|| std::env::var_os("KYBERN_FRAME_COSTS").is_some()).then(std::time::Instant::now);
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
+        if let Some(started) = kybern_started {
+            KYBERN_LAYOUT_NS.set(KYBERN_LAYOUT_NS.get()+started.elapsed().as_nanos());
+            KYBERN_LAYOUT_CALLS.set(KYBERN_LAYOUT_CALLS.get()+1);
+        }
     }
 
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
@@ -8031,4 +8043,9 @@ mod tests {
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
     }
+}
+
+thread_local! {
+    static KYBERN_LAYOUT_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    static KYBERN_LAYOUT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
