@@ -481,7 +481,14 @@ impl ArenaClearNeeded {
             std::ptr::eq(self.arena, &cx.element_arena),
             "ArenaClearNeeded::clear called with a different App than the draw ran against"
         );
-        cx.element_arena.borrow_mut().clear();
+        let (completed, contracted) = {
+            let mut arena = cx.element_arena.borrow_mut();
+            let completed = !arena.has_active_scope();
+            let before = arena.capacity();
+            arena.clear();
+            (completed, arena.capacity() < before)
+        };
+        if completed { crate::code_frame::memory_released(contracted); }
     }
 }
 

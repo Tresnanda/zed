@@ -33,6 +33,7 @@ mod inspector;
 mod interactive;
 mod key_dispatch;
 mod code_frame;
+pub use code_frame::set_code_memory_collector;
 mod keymap;
 mod path_builder;
 mod platform;

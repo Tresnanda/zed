@@ -136,6 +136,8 @@ impl Arena {
     /// invocations on Windows, or opening a window from within a draw), the nested
     /// draw's clear must not free memory the outer draw still references, so it is
     /// deferred: the outer draw's own clear will drop both draws' allocations.
+    pub(crate) fn has_active_scope(&self) -> bool { self.scope_depth != 0 }
+
     pub fn clear(&mut self) {
         if self.scope_depth == 0 {
             self.force_clear();
@@ -163,7 +165,9 @@ impl Arena {
             // Keep 2x the current frame to avoid churning on small fluctuations.
             let large_collapse = self.chunks.len() > 8 && used_chunks.saturating_mul(4) < self.chunks.len();
             if large_collapse {
-                self.chunks.truncate(used_chunks.saturating_mul(2).max(2));
+                // Keep the chunks this frame used after a large close.
+                let keep = if crate::code_frame::post_memory_enabled() { used_chunks } else { used_chunks.saturating_mul(2).max(2) };
+                self.chunks.truncate(keep);
             }
             if self.elements.capacity() > 16384 && used_elements.saturating_mul(4) < self.elements.capacity() {
                 self.elements.shrink_to(used_elements.saturating_mul(2).max(1024));
