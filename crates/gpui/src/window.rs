@@ -8234,3 +8234,15 @@ impl SubtreeTransformContext {
     /// Opacity 1 and no blur: what the subtree paints keeps its own alpha (compositor loops).
     pub(crate) fn kybern_paint_neutral(&self) -> bool { (self.opacity - 1.).abs() < 1e-4 && self.blur == 0. }
 }
+
+/// How far past the content mask (logical px, sideways) a translated line keeps its glyphs.
+const KYBERN_TRANSLATED_TEXT_REACH: f32 = 2048.0;
+impl Window {
+    /// The bounds a glyph must reach to be painted: the content mask, widened sideways inside a retained translation.
+    pub(crate) fn kybern_glyph_cull_bounds(&self, mask: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.subtree_tags.is_empty() {
+            return mask;
+        }
+        Bounds::new(point(mask.origin.x - px(KYBERN_TRANSLATED_TEXT_REACH), mask.origin.y), size(mask.size.width + px(2.0 * KYBERN_TRANSLATED_TEXT_REACH), mask.size.height))
+    }
+}

@@ -535,7 +535,7 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                if max_glyph_bounds.intersects(&window.kybern_glyph_cull_bounds(content_mask.bounds)) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
