@@ -2797,6 +2797,21 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
+            window.on_hover_reconcile({
+                let hitbox = hitbox.clone();
+                let hover_state = hover_state.clone();
+                move |event: &crate::window::HoverReconcileEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture { return; }
+                    if event.retired && hover_state.as_ref().is_none_or(|state| !state.borrow().element) { return; }
+                    let Some(hovered) = event.hovered(&hitbox, window) else { return };
+                    if let Some(state) = &hover_state {
+                        if state.borrow().element != hovered {
+                            state.borrow_mut().element = hovered;
+                            window.defer(cx, move |_, cx| cx.notify(current_view));
+                        }
+                    }
+                }
+            });
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
                 let was_hovered = hover_state
@@ -3102,6 +3117,26 @@ impl Interactivity {
                     }
                 }
 
+                window.on_hover_reconcile({
+                    let update_hover = update_hover.clone();
+                    let hitbox = hitbox.clone();
+                    let was_hovered = was_hovered.clone();
+                    let has_mouse_down = has_mouse_down.clone();
+                    move |event: &crate::window::HoverReconcileEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble { return; }
+                        if event.retired && !*was_hovered.borrow() { return; }
+                        let Some(hovered) = event.hovered(&hitbox, window) else { return };
+                        // Preserve a pressed owner still under the pointer,
+                        // like ordinary GPUI paint. A press alone must not
+                        // synthesize leave and cancel pending JS row drags.
+                        if !event.retired && hovered && has_mouse_down.borrow().is_some() { return; }
+                        let hovered = hovered && !cx.has_active_drag();
+                        if hovered != *was_hovered.borrow() {
+                            let update_hover = update_hover.clone();
+                            window.defer(cx, move |window, cx| update_hover(hovered, window, cx));
+                        }
+                    }
+                });
                 window.on_mouse_event({
                     let update_hover = update_hover.clone();
                     let hitbox = hitbox.clone();

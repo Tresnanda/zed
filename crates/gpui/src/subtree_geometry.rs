@@ -169,7 +169,7 @@ impl Window {
             self.platform_window.a11y_tree_update(update);
         }
         self.needs_present.set(true);
-        self.on_next_frame(|window, _| window.needs_present.set(true));
+        self.on_next_frame(|window, cx| { window.reconcile_rendered_hover(cx); window.needs_present.set(true); });
         true
     }
     pub(crate) fn record_subtree_a11y(&mut self, id: accesskit::NodeId) {

@@ -368,7 +368,7 @@ impl Window {
         }
         if changed {
             self.needs_present.set(true);
-            self.on_next_frame(|window, _| window.needs_present.set(true));
+            self.on_next_frame(|window, cx| { window.reconcile_rendered_hover(cx); window.needs_present.set(true); });
         }
         true
     }

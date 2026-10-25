@@ -3094,6 +3094,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.reconcile_layout_hover(cx);
         self.next_frame.clear();
         let dispatch_nodes = self.rendered_frame.dispatch_tree.len();
         self.rendered_frame.dispatch_tree.trim_memory(dispatch_nodes);
@@ -8201,3 +8202,5 @@ include!("subtree_transform_window.rs");
 include!("stream_fade_window.rs");
 
 include!("stroke_draw_window.rs");
+
+include!("hover_reconcile.rs");
