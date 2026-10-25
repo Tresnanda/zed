@@ -841,7 +841,10 @@ impl MetalRenderer {
             self.clear_paint_region(command_encoder, alpha as f32);
         let rounded_clips = writer.write(&scene.rounded_clips)?;
         for batch in scene.batches() {
+        for batch in Self::paint_region_batches(scene,batch,self.paint_region_scissor) {
             command_encoder.set_fragment_buffer(7, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        let paint_origin=self.paint_region_origin.map_or([0f32;2],|(x,y)|[x as f32,y as f32]);
+        command_encoder.set_fragment_bytes(8,mem::size_of_val(&paint_origin) as u64,paint_origin.as_ptr() as *const _);
             match batch {
                 PrimitiveBatch::Backdrop(index) => {
                     command_encoder.end_encoding();
@@ -914,6 +917,7 @@ impl MetalRenderer {
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
+        }
 
         }
         self.paint_region_origin=saved_origin;
@@ -976,6 +980,8 @@ impl MetalRenderer {
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         command_encoder.set_fragment_buffer(7, Some(&rounded_clips.buffer), rounded_clips.offset as u64);
+        let paint_origin=self.paint_region_origin.map_or([0f32;2],|(x,y)|[x as f32,y as f32]);
+        command_encoder.set_fragment_bytes(8,mem::size_of_val(&paint_origin) as u64,paint_origin.as_ptr() as *const _);
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,

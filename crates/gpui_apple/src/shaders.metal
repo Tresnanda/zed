@@ -133,7 +133,8 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
 
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+                              [[buffer(QuadInputIndex_Quads)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, quads[input.quad_id].content_mask.rounded_clip, clips);
 
   Quad quad = quads[input.quad_id];
@@ -532,7 +533,8 @@ vertex ShadowVertexOutput shadow_vertex(
 
 fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+                                [[buffer(ShadowInputIndex_Shadows)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, shadows[input.shadow_id].content_mask.rounded_clip, clips);
 
   Shadow shadow = shadows[input.shadow_id];
@@ -627,7 +629,8 @@ vertex UnderlineVertexOutput underline_vertex(
 
 fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
                                    constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+                                   [[buffer(UnderlineInputIndex_Underlines)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, underlines[input.underline_id].content_mask.rounded_clip, clips);
 
   const float WAVE_FREQUENCY = 2.0;
@@ -701,7 +704,8 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, input.rounded_clip, clips);
 
   if (any(input.clip_distance < float4(0.0))) {
@@ -756,7 +760,8 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, sprites[input.sprite_id].content_mask.rounded_clip, clips);
 
   PolychromeSprite sprite = sprites[input.sprite_id];
@@ -822,7 +827,8 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
-, device const RoundedClipNode *clips [[buffer(7)]]) {
+, device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, vertices[input.vertex_id].rounded_clip, clips);
 
   float2 dx = dfdx(input.st_position);
@@ -940,7 +946,8 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]], device const RoundedClipNode *clips [[buffer(7)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]], device const RoundedClipNode *clips [[buffer(7)]], constant float2 &paint_origin [[buffer(8)]]) {
+  input.position.xy+=paint_origin;
   float clip_alpha=rounded_clip_alpha(input.position.xy, input.rounded_clip, clips);
 
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
