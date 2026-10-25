@@ -271,7 +271,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, None, window, cx);
         (layout_id, state)
     }
 
@@ -345,7 +345,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, None, window, cx);
         (layout_id, state)
     }
 
@@ -391,6 +391,7 @@ impl IntoElement for SharedString {
 pub struct StyledText {
     text: SharedString,
     runs: Option<Vec<TextRun>>,
+    runs_provider: Option<Rc<dyn Fn()->Vec<TextRun>>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     layout: TextLayout,
@@ -402,6 +403,7 @@ impl StyledText {
         StyledText {
             text: text.into(),
             runs: None,
+            runs_provider: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
             layout: TextLayout::default(),
@@ -409,6 +411,9 @@ impl StyledText {
     }
 
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
+    /// Reuse caller-owned text geometry; the caller invalidates on style changes.
+    pub fn with_layout(mut self, layout: TextLayout) -> Self { self.layout=layout; self }
+
     pub fn layout(&self) -> &TextLayout {
         &self.layout
     }
@@ -523,6 +528,9 @@ impl StyledText {
     }
 
     /// Set the text runs for this piece of text.
+    /// Supply immutable document runs only when text geometry needs reshaping.
+    pub fn with_runs_provider(mut self,provider:Rc<dyn Fn()->Vec<TextRun>>)->Self {self.runs_provider=Some(provider);self}
+
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
         let mut text = &*self.text;
         for run in &runs {
@@ -571,7 +579,7 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let layout_id = self.layout.layout(self.text.clone(), runs, self.runs_provider.take(), window, cx);
         (layout_id, ())
     }
 
@@ -628,6 +636,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        runs_provider: Option<Rc<dyn Fn()->Vec<TextRun>>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -693,6 +702,8 @@ impl TextLayout {
                     return size;
                 }
 
+                let provided=runs_provider.as_ref().map(|provider|provider());
+                let runs=provided.as_ref().map_or(runs.as_slice(), |runs| runs.as_slice());
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp

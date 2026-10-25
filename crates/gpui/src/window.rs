@@ -4945,6 +4945,20 @@ impl Window {
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
+    /// Measure document blocks using an isolated layout engine. Only sizes may escape.
+    pub fn measure_markdown(&mut self,cx:&mut App,measure:impl FnOnce(&mut Window,&mut App)->Size<Pixels>)->Size<Pixels> {
+        // Cold block measurement must not grow the live frame arena to the whole document.
+        // Only owned text/geometry caches and a size escape this disposable arena.
+        let arena=RefCell::new(Arena::new(1024*1024));
+        let scope=ElementArenaScope::enter(&arena);
+        let parent=self.layout_engine.replace(TaffyLayoutEngine::new());
+        let result=self.with_element_namespace("__gpuix_markdown_measure",|window|measure(window,cx));
+        self.layout_engine=parent;
+        let _clear=scope.exit(&arena);
+        arena.borrow_mut().clear();
+        result
+    }
+
     pub fn compute_layout(
         &mut self,
         layout_id: LayoutId,
