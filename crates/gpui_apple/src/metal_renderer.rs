@@ -465,6 +465,13 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        static FRAME_POOL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FRAME_POOL.get_or_init(|| std::env::var("KYBERN_FRAME_POOL").as_deref() != Ok("0")) {
+            objc::rc::autoreleasepool(|| self.draw_with_frame_pool(scene));
+        } else { self.draw_with_frame_pool(scene); }
+    }
+
+    fn draw_with_frame_pool(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -479,6 +486,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let drawable_started = std::time::Instant::now();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -489,6 +497,9 @@ impl MetalRenderer {
             return;
         };
 
+        if drawable_started.elapsed().as_millis() > 100 && std::env::var_os("KYBERN_DRAWABLE_TIMES").is_some() {
+            eprintln!("[frame-drawable] {:.3} ms transaction={}", drawable_started.elapsed().as_secs_f64()*1000.0, self.presents_with_transaction);
+        }
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -559,6 +570,11 @@ impl MetalRenderer {
     /// use `render_scene_to_image()` instead.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
+        objc::rc::autoreleasepool(|| self.render_to_image_with_frame_pool(scene))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image_with_frame_pool(&mut self, scene: &Scene) -> Result<RgbaImage> {
         let layer = self
             .layer
             .clone()
