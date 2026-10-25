@@ -1714,7 +1714,7 @@ impl App {
                     .values()
                     .filter_map(|window| {
                         let window = window.as_deref()?;
-                        window.invalidator.is_dirty().then_some(window.handle)
+                        (!crate::window::scroll_input_frame_draw_enabled() && window.invalidator.is_dirty()).then_some(window.handle)
                     })
                     .collect::<Vec<_>>()
                 {

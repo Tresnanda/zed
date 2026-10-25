@@ -1669,6 +1669,9 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(listener) = self.interactivity.paint_bounds_listener.take() {
+            listener(bounds, window, cx);
+        }
         let current_view = window.current_view();
 
         // Register the scroll listener before painting children so that, in
@@ -1683,6 +1686,7 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                if event.delta.pixel_delta(px(20.)).y == px(0.) { return; }
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(

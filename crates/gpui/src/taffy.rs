@@ -26,9 +26,12 @@ type MeasureFn =
 type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
+    last_measure: Option<ScrollMeasure>,
     measure: NodeMeasureFn,
 }
+include!("scroll_taffy.rs");
 pub struct TaffyLayoutEngine {
+    scroll_layouts: ScrollLayouts,
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
@@ -45,6 +48,7 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            scroll_layouts: Default::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -53,6 +57,7 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
+        self.scroll_layouts.next_frame();
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
@@ -101,7 +106,7 @@ impl TaffyLayoutEngine {
         let measure = StackSafe::new(measure);
 
         self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
+            .new_leaf_with_context(taffy_style, NodeContext { measure, last_measure: None })
             .expect(EXPECT_MESSAGE)
             .into()
     }
@@ -202,6 +207,8 @@ impl TaffyLayoutEngine {
         // }
         //
 
+        if self.reuse_scroll_layout(id, available_space, window, cx) { return; }
+        let scroll_available = available_space;
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
@@ -261,10 +268,12 @@ impl TaffyLayoutEngine {
 
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
+                    node_context.last_measure = Some(ScrollMeasure { known: known_dimensions, available: available_space, result: measured_size });
                     snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                 },
             )
             .expect(EXPECT_MESSAGE);
+        self.remember_scroll_layout(id, scroll_available, scale_factor);
     }
 
     // Pixel snapping

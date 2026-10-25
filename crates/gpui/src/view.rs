@@ -241,6 +241,7 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    scroll_independent_cache: Option<u64>,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -253,6 +254,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            scroll_independent_cache: None,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -268,6 +270,13 @@ impl<V: View> ViewElement<V> {
     /// view has no such contract, so a frozen subtree could never be invalidated.
     /// Reach this through [`Entity::cached`] or [`AnyView::cached`], which are
     /// entity-backed by construction.
+    /// Retain this explicitly invalidated scroll viewport when a cached parent
+    /// re-renders. Global refresh, dirty entities and geometry/style changes
+    /// still invalidate it. Call only when content changes notify this entity.
+    pub fn independent_scroll_cache(mut self, revision: u64) -> Self {
+        self.scroll_independent_cache = Some(revision);
+        self
+    }
     pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style);
         self
@@ -290,6 +299,7 @@ struct ViewElementState {
 }
 
 struct ViewElementCacheKey {
+    scroll_revision: Option<u64>,
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
@@ -387,8 +397,9 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
+                            && element_state.cache_key.scroll_revision == self.scroll_independent_cache
                             && !window.dirty_views.contains(&entity_id)
-                            && !window.refreshing
+                            && (!window.refreshing || (self.scroll_independent_cache.is_some() && window.scroll_parent_refresh))
                         {
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -401,6 +412,8 @@ impl<V: View> Element for ViewElement<V> {
                         }
 
                         let refreshing = mem::replace(&mut window.refreshing, true);
+                        let parent_refresh = window.scroll_parent_refresh;
+                        window.scroll_parent_refresh = parent_refresh || !refreshing;
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
@@ -409,6 +422,10 @@ impl<V: View> Element for ViewElement<V> {
                                 .unwrap()
                                 .render(window, cx)
                                 .into_any_element();
+                            if let Some(revision) = self.scroll_independent_cache {
+                                let layout = element.request_layout(window, cx);
+                                window.cache_scroll_layout(layout, [entity_id.as_u64(), u64::MAX, revision]);
+                            }
                             element.layout_as_root(bounds.size.into(), window, cx);
                             element.prepaint_at(bounds.origin, window, cx);
                             element
@@ -416,6 +433,7 @@ impl<V: View> Element for ViewElement<V> {
 
                         let prepaint_end = window.prepaint_index();
                         window.refreshing = refreshing;
+                        window.scroll_parent_refresh = parent_refresh;
 
                         (
                             Some(element),
@@ -424,6 +442,7 @@ impl<V: View> Element for ViewElement<V> {
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key: ViewElementCacheKey {
+                                    scroll_revision: self.scroll_independent_cache,
                                     bounds,
                                     content_mask,
                                     text_style,

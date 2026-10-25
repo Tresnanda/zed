@@ -1185,6 +1185,7 @@ pub struct Window {
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     rounded_clip_pool: RoundedClipPool,
+    scroll_input: ScrollInput,
     subtree_tags: Vec<(u64, Point<Pixels>)>,
     subtree_a11y: std::collections::HashMap<accesskit::NodeId,SubtreeGeometry>,
     subtree_masks: Vec<SubtreeMask>,
@@ -1226,6 +1227,7 @@ pub struct Window {
     last_input_modality: InputModality,
     keyboard_modality_mouse_origin: Point<Pixels>,
     pub(crate) refreshing: bool,
+    pub(crate) scroll_parent_refresh: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1878,6 +1880,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             rounded_clip_pool: Default::default(),
+            scroll_input: Default::default(),
             subtree_tags: Vec::new(),
             subtree_a11y: Default::default(),
             subtree_masks: Vec::new(),
@@ -1914,6 +1917,7 @@ impl Window {
             last_input_modality: InputModality::Mouse,
             keyboard_modality_mouse_origin: mouse_position,
             refreshing: false,
+            scroll_parent_refresh: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3055,6 +3059,10 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
+        if kybern_started.is_some() {
+            let (hits, nodes) = self.layout_engine.as_ref().unwrap().scroll_layout_stats();
+            eprintln!("[scroll-layout-frame] hits={} nodes={}", hits, nodes);
+        }
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
@@ -3130,6 +3138,7 @@ impl Window {
         if let Some(started) = kybern_started {
             eprintln!("[kybern-work] renderMs={:.3} layoutMs={:.3} layoutCalls={}", started.elapsed().as_secs_f64()*1000.0, KYBERN_LAYOUT_NS.get() as f64 / 1e6, KYBERN_LAYOUT_CALLS.get());
         }
+        self.scroll_input_painted();
         arena_scope.exit(&cx.element_arena)
     }
 
@@ -5007,6 +5016,14 @@ impl Window {
         result
     }
 
+    /// Reuse root-relative layout geometry for a retained, unchanged scroll row.
+    pub fn cache_scroll_layout(&mut self, id: LayoutId, key: [u64; 3]) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ENABLED.get_or_init(||std::env::var("KYBERN_SCROLL_LAYOUT").as_deref()!=Ok("0")) {
+            self.layout_engine.as_mut().unwrap().cache_scroll_layout(id, key);
+        }
+    }
+    /// Compute layout within the available space.
     pub fn compute_layout(
         &mut self,
         layout_id: LayoutId,
@@ -5358,6 +5375,19 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        if !self.scroll_input.dispatching {
+            if let PlatformInput::ScrollWheel(wheel) = &event {
+                if self.queue_scroll_input(wheel,cx) {
+                    return DispatchEventResult {propagate:false,default_prevented:true};
+                }
+                self.flush_scroll_input(cx);
+                self.record_direct_scroll_input();
+            } else {
+                // Preserve ordering with clicks, keys, pointer moves and focus.
+                self.flush_scroll_input(cx);
+            }
+        }
+
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -5517,6 +5547,9 @@ impl Window {
         self.promote_external_drag_to_platform(&event, cx);
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
+        if !self.scroll_input.dispatching && !caused_invalidation && !self.invalidator.is_dirty() {
+            self.scroll_input.paint = None;
+        }
         if caused_invalidation {
             self.input_rate_tracker.borrow_mut().record_input();
         }
@@ -8096,3 +8129,5 @@ thread_local! {
 include!("rounded_clip.rs");
 
 include!("subtree_geometry.rs");
+
+include!("scroll_input.rs");
