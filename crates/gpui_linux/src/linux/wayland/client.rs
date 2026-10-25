@@ -215,7 +215,6 @@ pub struct Globals {
         Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
     pub wm_base: xdg_wm_base::XdgWmBase,
     pub shm: wl_shm::WlShm,
-    pub seat: wl_seat::WlSeat,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
@@ -235,7 +234,6 @@ impl Globals {
         globals: GlobalList,
         executor: ForegroundExecutor,
         qh: QueueHandle<WaylandClientStatePtr>,
-        seat: wl_seat::WlSeat,
         frame_ping: Ping,
     ) -> Self {
         let dialog_v = XdgWmDialogV1::interface().version;
@@ -259,7 +257,6 @@ impl Globals {
                 .ok(),
             primary_selection_manager: globals.bind(&qh, 1..=1, ()).ok(),
             shm: globals.bind(&qh, 1..=1, ()).unwrap(),
-            seat,
             wm_base: globals.bind(&qh, 1..=5, ()).unwrap(),
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -315,7 +312,9 @@ pub(crate) struct WaylandClientState {
     globals: Globals,
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
-    wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
+    // None until the compositor advertises a seat: headless compositors (Weston's
+    // headless backend) may have none, and a seat can appear later.
+    wl_seat: Option<wl_seat::WlSeat>, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
@@ -486,6 +485,11 @@ impl WaylandClientStatePtr {
 
     pub fn get_serial(&self, kind: SerialKind) -> Serial {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
+    }
+
+    /// The current seat; windows ask here because a seat can appear after they open.
+    pub fn seat(&self) -> Option<wl_seat::WlSeat> {
+        self.0.upgrade()?.borrow().wl_seat.clone()
     }
 
     pub fn start_external_drag(
@@ -717,6 +721,28 @@ impl Drop for WaylandClient {
 
 const WL_DATA_DEVICE_MANAGER_VERSION: u32 = 3;
 
+fn seat_devices(
+    globals: &Globals,
+    seat: Option<&wl_seat::WlSeat>,
+    qh: &QueueHandle<WaylandClientStatePtr>,
+) -> (
+    Option<wl_data_device::WlDataDevice>,
+    Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
+) {
+    let Some(seat) = seat else {
+        return (None, None);
+    };
+    let data_device = globals
+        .data_device_manager
+        .as_ref()
+        .map(|data_device_manager| data_device_manager.get_data_device(seat, qh, ()));
+    let primary_selection = globals
+        .primary_selection_manager
+        .as_ref()
+        .map(|primary_selection_manager| primary_selection_manager.get_device(seat, qh, ()));
+    (data_device, primary_selection)
+}
+
 fn wl_seat_version(version: u32) -> u32 {
     // We rely on the wl_pointer.frame event
     const WL_SEAT_MIN_VERSION: u32 = 5;
@@ -747,11 +773,15 @@ fn wl_output_version(version: u32) -> u32 {
 }
 
 impl WaylandClient {
-    pub(crate) fn new() -> Self {
-        let startup_activation_token = take_startup_activation_token_from_environment();
-        let conn = Connection::connect_to_env().unwrap();
+    /// Fails when the compositor named by `WAYLAND_DISPLAY` cannot be reached, so
+    /// the caller can fall back to X11.
+    pub(crate) fn new() -> anyhow::Result<Self> {
+        let conn = Connection::connect_to_env()
+            .map_err(|error| anyhow::anyhow!("connecting to the Wayland compositor: {error}"))?;
 
-        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
+        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn)
+            .map_err(|error| anyhow::anyhow!("reading the Wayland registry: {error}"))?;
+        let startup_activation_token = take_startup_activation_token_from_environment();
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
@@ -829,24 +859,17 @@ impl WaylandClient {
             })
             .unwrap();
 
-        let seat = seat.unwrap();
+        if seat.is_none() {
+            log::warn!("wayland: the compositor has no wl_seat; input stays off until one appears");
+        }
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
             qh.clone(),
-            seat.clone(),
             frame_ping,
         );
 
-        let data_device = globals
-            .data_device_manager
-            .as_ref()
-            .map(|data_device_manager| data_device_manager.get_data_device(&seat, &qh, ()));
-
-        let primary_selection = globals
-            .primary_selection_manager
-            .as_ref()
-            .map(|primary_selection_manager| primary_selection_manager.get_device(&seat, &qh, ()));
+        let (data_device, primary_selection) = seat_devices(&globals, seat.as_ref(), &qh);
 
         let cursor = Cursor::new(&conn, &globals, 24);
 
@@ -973,7 +996,7 @@ impl WaylandClient {
             .insert(handle)
             .unwrap();
 
-        Self(state)
+        Ok(Self(state))
     }
 }
 
@@ -1060,7 +1083,9 @@ impl LinuxClient for WaylandClient {
                         .get(SerialKind::MousePress)
                         .as_raw()
                         .max(state.serial_tracker.get(SerialKind::KeyPress).as_raw());
-                    (serial != 0).then(|| (serial, state.wl_seat.clone()))
+                    (serial != 0)
+                        .then(|| state.wl_seat.clone().map(|seat| (serial, seat)))
+                        .flatten()
                 });
                 (Some(parent), popup_grab.flatten())
             }
@@ -1157,7 +1182,9 @@ impl LinuxClient for WaylandClient {
             state.pending_activation = Some(PendingActivation::Uri(uri.to_string()));
             let token = activation.get_activation_token(&state.globals.qh, ());
             let serial = state.serial_tracker.get(SerialKind::MousePress);
-            token.set_serial(serial.as_raw(), &state.wl_seat);
+            if let Some(seat) = &state.wl_seat {
+                token.set_serial(serial.as_raw(), seat);
+            }
             token.set_surface(&window.surface());
             token.commit();
         } else {
@@ -1175,7 +1202,9 @@ impl LinuxClient for WaylandClient {
             state.pending_activation = Some(PendingActivation::Path(path));
             let token = activation.get_activation_token(&state.globals.qh, ());
             let serial = state.serial_tracker.get(SerialKind::MousePress);
-            token.set_serial(serial.as_raw(), &state.wl_seat);
+            if let Some(seat) = &state.wl_seat {
+                token.set_serial(serial.as_raw(), seat);
+            }
             token.set_surface(&window.surface());
             token.commit();
         } else {
@@ -1384,13 +1413,28 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
                     }
-                    state.wl_seat.release();
-                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(
+                    if let Some(seat) = state.wl_seat.take() {
+                        seat.release();
+                    }
+                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(
                         name,
                         wl_seat_version(version),
                         qh,
                         (),
                     );
+                    // Devices made for the previous seat (or none, before the first
+                    // seat) follow the new one.
+                    if let Some(data_device) = state.data_device.take() {
+                        data_device.release();
+                    }
+                    if let Some(primary_selection) = state.primary_selection.take() {
+                        primary_selection.destroy();
+                    }
+                    let (data_device, primary_selection) =
+                        seat_devices(&state.globals, Some(&seat), qh);
+                    state.data_device = data_device;
+                    state.primary_selection = primary_selection;
+                    state.wl_seat = Some(seat);
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(

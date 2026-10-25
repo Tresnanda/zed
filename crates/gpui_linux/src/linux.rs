@@ -39,9 +39,23 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
 
     match gpui::guess_compositor() {
         #[cfg(feature = "wayland")]
-        "Wayland" => Rc::new(LinuxPlatform {
-            inner: WaylandClient::new(),
-        }),
+        "Wayland" => match WaylandClient::new() {
+            Ok(inner) => Rc::new(LinuxPlatform { inner }),
+            // Kybern: a stale WAYLAND_DISPLAY (an X11 session that inherited it, a
+            // stopped compositor) should not take the app down when X11 is there.
+            #[cfg(feature = "x11")]
+            Err(error)
+                if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) =>
+            {
+                log::warn!("{error:#}; using X11 instead");
+                Rc::new(LinuxPlatform {
+                    inner: X11Client::new()
+                        .context("Failed to initialize X11 client.")
+                        .unwrap(),
+                })
+            }
+            Err(error) => panic!("{error:#}"),
+        },
 
         #[cfg(feature = "x11")]
         "X11" => Rc::new(LinuxPlatform {

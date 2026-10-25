@@ -1769,7 +1769,9 @@ impl PlatformWindow for WaylandWindow {
             // The serial isn't exactly important here, since the activation is probably going to be rejected anyway.
             let serial = state.client.get_serial(SerialKind::MousePress);
             token.set_app_id(app_id);
-            token.set_serial(serial.as_raw(), &state.globals.seat);
+            if let Some(seat) = state.client.seat() {
+                token.set_serial(serial.as_raw(), &seat);
+            }
             token.set_surface(&state.surface);
             token.commit();
         }
@@ -1954,9 +1956,10 @@ impl PlatformWindow for WaylandWindow {
     fn show_window_menu(&self, position: Point<Pixels>) {
         let state = self.borrow();
         let serial = state.client.get_serial(SerialKind::MousePress);
-        if let Some(toplevel) = state.surface_state.toplevel() {
+        if let (Some(toplevel), Some(seat)) = (state.surface_state.toplevel(), state.client.seat())
+        {
             toplevel.show_window_menu(
-                &state.globals.seat,
+                &seat,
                 serial.as_raw(),
                 f32::from(position.x) as i32,
                 f32::from(position.y) as i32,
@@ -1967,8 +1970,9 @@ impl PlatformWindow for WaylandWindow {
     fn start_window_move(&self) {
         let state = self.borrow();
         let serial = state.client.get_serial(SerialKind::MousePress);
-        if let Some(toplevel) = state.surface_state.toplevel() {
-            toplevel._move(&state.globals.seat, serial.as_raw());
+        if let (Some(toplevel), Some(seat)) = (state.surface_state.toplevel(), state.client.seat())
+        {
+            toplevel._move(&seat, serial.as_raw());
         }
     }
 
@@ -1983,9 +1987,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
-        if let Some(toplevel) = state.surface_state.toplevel() {
+        if let (Some(toplevel), Some(seat)) = (state.surface_state.toplevel(), state.client.seat())
+        {
             toplevel.resize(
-                &state.globals.seat,
+                &seat,
                 state.client.get_serial(SerialKind::MousePress).as_raw(),
                 edge.to_xdg(),
             )
