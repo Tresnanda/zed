@@ -10,6 +10,14 @@ use metal::Device;
 use parking_lot::Mutex;
 use std::borrow::Cow;
 
+static GPU_UPLOADS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+fn gpu_atlas_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("KYBERN_GPU_TRACE").as_deref() == Ok("1"))
+}
+pub(crate) fn take_gpu_uploads() -> [u64;3] {
+    std::array::from_fn(|i| GPU_UPLOADS[i].swap(0,std::sync::atomic::Ordering::Relaxed))
+}
 pub struct MetalAtlas {
     state: Mutex<MetalAtlasState>,
     last_submission: Mutex<Option<AssertSend<metal::CommandBuffer>>>,
@@ -109,6 +117,7 @@ impl PlatformAtlas for MetalAtlas {
         let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        if gpu_atlas_trace() { GPU_UPLOADS[2].fetch_add(1,std::sync::atomic::Ordering::Relaxed); }
         let id = tile.texture_id;
 
         let textures = match id.kind {
@@ -269,6 +278,10 @@ impl MetalAtlasTexture {
     }
 
     fn upload(&self, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
+        if gpu_atlas_trace() {
+            GPU_UPLOADS[0].fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            GPU_UPLOADS[1].fetch_add(bytes.len() as u64,std::sync::atomic::Ordering::Relaxed);
+        }
         let region = metal::MTLRegion::new_2d(
             bounds.origin.x.into(),
             bounds.origin.y.into(),

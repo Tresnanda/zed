@@ -609,6 +609,7 @@ impl MetalRenderer {
                 pool.buffers.iter().map(|buffer| buffer.length()).sum(), self.sprite_atlas.allocated_bytes(),
                 texture_bytes(&self.path_intermediate_texture), self.backdrop_resources.as_ref().map_or(0, |r| texture_bytes(&r.scratch))]);
         }
+        gpu_trace_scene(scene, viewport_size);
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
         let block = ConcreteBlock::new(move |_| {
@@ -1006,6 +1007,7 @@ impl MetalRenderer {
             Some(&vertex_instance_bindings.buffer),
             vertex_instance_bindings.offset as u64,
         );
+        gpu_record_draw();
         command_encoder.draw_primitives(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1049,6 +1051,8 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
 
+        gpu_record_draw();
+
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1090,6 +1094,8 @@ impl MetalRenderer {
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
+
+        gpu_record_draw();
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
@@ -1162,6 +1168,8 @@ impl MetalRenderer {
             sprite_instance_bindings.offset as u64,
         );
 
+        gpu_record_draw();
+
         command_encoder.draw_primitives_instanced(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1203,6 +1211,8 @@ impl MetalRenderer {
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
+
+        gpu_record_draw();
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
@@ -1258,6 +1268,8 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
+        gpu_record_draw();
+
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
             0,
@@ -1311,6 +1323,8 @@ impl MetalRenderer {
             instance_bindings.polychrome_sprites.offset as u64,
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
+
+        gpu_record_draw();
 
         command_encoder.draw_primitives_instanced_base_instance(
             metal::MTLPrimitiveType::Triangle,
@@ -1398,6 +1412,8 @@ impl MetalRenderer {
                 let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
+
+            gpu_record_draw();
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1851,3 +1867,28 @@ include!("paint_region_cull.rs");
 include!("paint_region_atlas.rs");
 
 include!("gpu_clip.rs");
+
+static GPU_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn gpu_trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("KYBERN_GPU_TRACE").as_deref() == Ok("1"))
+}
+fn gpu_record_draw() {
+    if gpu_trace_enabled() { GPU_DRAWS.fetch_add(1,std::sync::atomic::Ordering::Relaxed); }
+}
+fn gpu_trace_scene(scene: &Scene, viewport: Size<DevicePixels>) {
+    if !gpu_trace_enabled() { return; }
+    let [uploads,bytes,evictions]=crate::metal_atlas::take_gpu_uploads();
+    let draws=GPU_DRAWS.swap(0,std::sync::atomic::Ordering::Relaxed);
+    let clipped=scene.monochrome_sprites.iter().filter(|s|s.content_mask.rounded_clip!=0).count();
+    let (clip_steps,clip_depth)=scene.monochrome_sprites.iter().fold((0usize,0usize),|(sum,max),sprite| {
+        let mut id=sprite.content_mask.rounded_clip; let mut depth=0;
+        while id!=0 { let Some(clip)=scene.rounded_clips.get(id as usize) else { break; }; depth+=1; id=clip.parent; }
+        (sum+depth,max.max(depth))
+    });
+    let pruned=scene.monochrome_sprites.iter().filter(|s|s.content_mask.rounded_clip!=0 && s.transformation==gpui::TransformationMatrix::unit() && gpu_clip_prune(scene,s.content_mask,s.bounds).rounded_clip==0).count();
+    let area=|b:Bounds<ScaledPixels>,m:ContentMask<ScaledPixels>| { let b=b.intersect(&m.bounds); (b.size.width.0.max(0.)*b.size.height.0.max(0.)) as u64 };
+    let raster_area:u64=scene.quads.iter().map(|v|area(v.bounds,v.content_mask)).chain(scene.monochrome_sprites.iter().map(|v|area(v.bounds,v.content_mask))).chain(scene.polychrome_sprites.iter().map(|v|area(v.bounds,v.content_mask))).sum();
+    let instance_bytes=scene.quads.len()*mem::size_of::<gpui::Quad>()+scene.monochrome_sprites.len()*mem::size_of::<gpui::MonochromeSprite>()+scene.polychrome_sprites.len()*mem::size_of::<gpui::PolychromeSprite>()+scene.shadows.len()*mem::size_of::<gpui::Shadow>()+scene.underlines.len()*mem::size_of::<gpui::Underline>()+scene.surfaces.len()*mem::size_of::<SurfaceBounds>()+scene.rounded_clips.len()*mem::size_of::<gpui::RoundedClip>();
+    eprintln!("[gpu-scene] generation={} draws={} backdropDraws={} batches={} quads={} glyphs={} colorSprites={} shadows={} paths={} pathVertices={} backdrops={} roundedNodes={} glyphClipSteps={} glyphClipDepthMax={} roundedGlyphs={} prunedGlyphs={} atlasUploads={} atlasBytes={} atlasEvictions={} instanceBytes={} rasterArea={} viewport={}x{}",scene.paint_generation,draws,2*scene.backdrops.iter().filter(|b|b.opacity>0. && !b.bounds.intersect(&b.content_mask.bounds).is_empty()).count(),scene.batches().count(),scene.quads.len(),scene.monochrome_sprites.len(),scene.polychrome_sprites.len(),scene.shadows.len(),scene.paths.len(),scene.paths.iter().map(|p|p.vertices.len()).sum::<usize>(),scene.backdrops.len(),scene.rounded_clips.len(),clip_steps,clip_depth,clipped,pruned,uploads,bytes,evictions,instance_bytes,raster_area,i32::from(viewport.width),i32::from(viewport.height));
+}
