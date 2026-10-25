@@ -51,6 +51,9 @@ pub struct Scene {
     pub(crate) stroke_tags: std::collections::HashMap<usize, std::sync::Arc<StrokeDraw>>,
     stroke_slots: std::collections::HashMap<usize, usize>,
     pending_stroke: Option<std::sync::Arc<StrokeDraw>>,
+    pub(crate) active_color_fade: Option<(std::sync::Arc<crate::window::ColorFadeTag>, u8)>,
+    pub(crate) color_fades: std::collections::HashMap<usize, (std::sync::Arc<crate::window::ColorFadeTag>, u8)>,
+    color_fade_slots: std::collections::HashMap<usize, usize>,
     /// Every scope painted into this scene, including ones that drew nothing (an empty glyph slot fading back in).
     pub(crate) transform_scopes: std::collections::HashSet<u64>,
     pub(crate) active_subtree_geometry: Option<std::sync::Arc<crate::window::SubtreeGeometry>>,
@@ -105,6 +108,9 @@ impl Scene {
         self.stroke_tags.clear();
         self.stroke_slots.clear();
         self.pending_stroke = None;
+        self.active_color_fade = None;
+        self.color_fades.clear();
+        self.color_fade_slots.clear();
         self.subtree_geometries.clear();
         self.active_subtree_geometry = None;
         self.repaint_tags.clear();
@@ -225,6 +231,7 @@ impl Scene {
         if let Some(base) = transform_base { self.transform_bases.insert(self.paint_operations.len(), base); }
         if let Some(tag) = fade_tag { self.fade_tags.insert(self.paint_operations.len(), tag); }
         if let Some(tag) = stroke_tag { self.stroke_tags.insert(self.paint_operations.len(), tag); }
+        if let (Some(tag), Primitive::Quad(_)) = (&self.active_color_fade, &primitive) { self.color_fades.insert(self.paint_operations.len(), tag.clone()); }
         if let Some(geometry) = &self.active_subtree_geometry { self.subtree_geometries.insert(self.paint_operations.len(),geometry.clone()); }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -234,7 +241,9 @@ impl Scene {
         if range.start == 0 && range.end == prev_scene.paint_operations.len() { self.transform_scopes.extend(prev_scene.transform_scopes.iter().copied()); }
         let previous_geometry = self.active_subtree_geometry.clone();
         let previous_tag = self.active_repaint_tag;
+        let previous_color_fade = self.active_color_fade.take();
         for index in range {
+            self.active_color_fade = prev_scene.color_fades.get(&index).cloned();
             self.active_repaint_tag = prev_scene.repaint_tags.get(&index).copied();
             self.active_subtree_geometry = prev_scene.subtree_geometries.get(&index).cloned().or_else(|| previous_geometry.clone());
             self.pending_transform_base = prev_scene.transform_bases.get(&index).cloned();
@@ -252,6 +261,7 @@ impl Scene {
         self.pending_transform_base = None;
         self.pending_fade = None;
         self.pending_stroke = None;
+        self.active_color_fade = previous_color_fade;
     }
 
     /// Replace only recorded quad fills / monochrome tint, preserving geometry,
@@ -371,6 +381,7 @@ impl Scene {
     pub fn finish(&mut self) {
         self.fade_slots_update();
         self.stroke_slots_update();
+        self.color_fade_slots_update();
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.paint_generation = GENERATION.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         // Stable sorts below retain insertion order among equal keys. Derive
@@ -1639,3 +1650,5 @@ impl Scene {
         spans
     }
 }
+
+include!("hover_fade_scene.rs");

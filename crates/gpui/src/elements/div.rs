@@ -832,6 +832,12 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Ease background and border colour changes caused by hover and press release (Kybern).
+    fn color_transition(mut self, transition: crate::ColorTransition) -> Self {
+        self.interactivity().color_transition = Some(transition);
+        self
+    }
+
     /// Apply the given style to this element when the mouse hovers over it
     fn hover(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
         debug_assert!(
@@ -2102,6 +2108,7 @@ pub struct Interactivity {
     pub(crate) group_hover_style: Option<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
     pub(crate) group_active_style: Option<GroupStyle>,
+    pub(crate) color_transition: Option<crate::ColorTransition>,
     pub(crate) drag_over_styles: Vec<(
         TypeId,
         Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> StyleRefinement>,
@@ -2459,7 +2466,14 @@ impl Interactivity {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
 
-                let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
+                let mut style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
+                let kybern_fade = self.color_transition.and_then(|transition| {
+                    let hovered = self.hover_style.is_some() && !cx.has_active_drag() && hitbox.is_some_and(|hitbox| hitbox.is_hovered(window));
+                    let pressed = self.active_style.is_some()
+                        && element_state.as_ref().and_then(|state| state.clicked_state.as_ref()).is_some_and(|state| state.borrow().element);
+                    let state = element_state.as_mut()?;
+                    crate::window::kybern_color_fade(transition, &mut state.color_fade, &mut style, &self.base_style, hovered, pressed)
+                });
 
                 #[cfg(any(feature = "test-support", test))]
                 if let Some(debug_selector) = &self.debug_selector {
@@ -2485,7 +2499,7 @@ impl Interactivity {
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
-                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                    window.kybern_paint_style_with_fade(&style, kybern_fade, bounds, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             let overflow_mask = window.rounded_overflow_mask(&style, bounds);
                             window.with_content_mask(
@@ -3598,6 +3612,7 @@ pub struct InteractiveElementState {
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    pub(crate) color_fade: Option<crate::window::ColorFadeState>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.

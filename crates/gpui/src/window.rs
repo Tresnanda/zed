@@ -3208,6 +3208,7 @@ impl Window {
         let animated = self.rendered_frame.scene.animate_tagged();
         let animated = self.rendered_frame.scene.animate_fades() | animated;
         let animated = self.animate_strokes() | animated;
+        let animated = self.rendered_frame.scene.animate_color_fades() | animated;
         self.platform_window.draw(&self.rendered_frame.scene);
         if *TRACE.get_or_init(|| std::env::var_os("KYBERN_FRAME_TIMES").is_some()) {
             let message=format!("[kybern-submit] {:.3}\n", ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()*1000.0); let _=std::io::Write::write_all(&mut std::io::stderr().lock(),message.as_bytes());
@@ -8246,3 +8247,5 @@ impl Window {
         Bounds::new(point(mask.origin.x - px(KYBERN_TRANSLATED_TEXT_REACH), mask.origin.y), size(mask.size.width + px(2.0 * KYBERN_TRANSLATED_TEXT_REACH), mask.size.height))
     }
 }
+
+include!("hover_fade_window.rs");
