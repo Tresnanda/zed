@@ -1159,6 +1159,7 @@ mod tests {
                 tag: "thread-1".into(),
                 title: "Task started".into(),
                 body: "Running tests".into(),
+                silent: false,
                 actions: Vec::new(),
             });
         });
@@ -1171,12 +1172,14 @@ mod tests {
                 tag: "thread-1".into(),
                 title: "Task started".into(),
                 body: "Running tests".into(),
+                silent: false,
                 actions: Vec::new(),
             });
             cx.show_system_notification(SystemNotification {
                 tag: "thread-1".into(),
                 title: "Task finished".into(),
                 body: "All tests passed".into(),
+                silent: false,
                 actions: vec![SystemNotificationAction {
                     id: "open".into(),
                     label: "Open".into(),
@@ -1195,6 +1198,7 @@ mod tests {
                 tag: "thread-1".into(),
                 title: "Task finished".into(),
                 body: "All tests passed".into(),
+                silent: false,
                 actions: vec![SystemNotificationAction {
                     id: "open".into(),
                     label: "Open".into(),
@@ -1274,6 +1278,7 @@ mod tests {
                 tag: "thread-1".into(),
                 title: "Task finished".into(),
                 body: "All tests passed".into(),
+                silent: false,
                 actions: Vec::new(),
             });
             cx.on_system_notification_response(|response, cx| {

@@ -473,6 +473,10 @@ pub struct SystemNotification {
     /// Buttons offered on the notification. Platforms that cannot display
     /// action buttons show the notification without them.
     pub actions: Vec<SystemNotificationAction>,
+    /// Post without a sound where the platform can (a replacement of a
+    /// notification the user just heard, say). Platforms without the option
+    /// ignore it.
+    pub silent: bool,
 }
 
 /// A button offered on a [`SystemNotification`].

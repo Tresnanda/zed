@@ -19,11 +19,28 @@ use windows::core::{IInspectable, Interface as _, h};
 
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
 
+/// The toast a tag last showed, kept only so `dismiss` can hide it. The serial
+/// tells a toast's own activated/dismissed event from a later post's.
+type ActiveToasts = Rc<RefCell<HashMap<SharedString, (u64, ToastNotification)>>>;
+
+const MAX_ACTIVE_TOASTS: usize = 64;
+
+/// What the toast event handlers (WinRT threads) tell the foreground task.
+enum ToastEvent {
+    Response(SystemNotificationResponse),
+    /// The toast was clicked, which removes it from the action center: nothing is left to hide.
+    Gone {
+        tag: SharedString,
+        serial: u64,
+    },
+}
+
 pub(crate) struct SystemNotificationState {
     notifier: Option<ToastNotifier>,
-    active_toasts: HashMap<SharedString, ToastNotification>,
-    response_sender: mpsc::UnboundedSender<SystemNotificationResponse>,
-    response_receiver: Option<mpsc::UnboundedReceiver<SystemNotificationResponse>>,
+    active_toasts: ActiveToasts,
+    next_serial: u64,
+    response_sender: mpsc::UnboundedSender<ToastEvent>,
+    response_receiver: Option<mpsc::UnboundedReceiver<ToastEvent>>,
     callback: ResponseCallback,
     _response_task: Option<Task<()>>,
 }
@@ -33,7 +50,8 @@ impl SystemNotificationState {
         let (response_sender, response_receiver) = mpsc::unbounded();
         Self {
             notifier: None,
-            active_toasts: HashMap::new(),
+            active_toasts: Rc::new(RefCell::new(HashMap::new())),
+            next_serial: 0,
             response_sender,
             response_receiver: Some(response_receiver),
             callback: Rc::new(RefCell::new(None)),
@@ -62,6 +80,8 @@ impl SystemNotificationState {
         };
         toast.SetTag(&tag.into())?;
 
+        self.next_serial += 1;
+        let serial = self.next_serial;
         let sender = self.response_sender.clone();
         let response_tag = notification.tag.clone();
         toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
@@ -73,25 +93,44 @@ impl SystemNotificationState {
                     .filter(|arguments| !arguments.is_empty())
                     .map(|arguments| SharedString::from(arguments.to_string()));
                 sender
-                    .unbounded_send(SystemNotificationResponse {
+                    .unbounded_send(ToastEvent::Response(SystemNotificationResponse {
                         tag: response_tag.clone(),
                         action_id,
+                    }))
+                    .ok();
+                sender
+                    .unbounded_send(ToastEvent::Gone {
+                        tag: response_tag.clone(),
+                        serial,
                     })
                     .ok();
                 Ok(())
             },
         ))?;
-
-        if let Some(previous) = self.active_toasts.remove(&notification.tag) {
-            notifier.Hide(&previous)?;
-        }
+        // No `Hide` of the previous toast: a toast with the same tag replaces
+        // it in the action center. Hiding it first failed once the user had
+        // dismissed or cleared it, and that error stopped the new toast from
+        // showing at all.
         notifier.Show(&toast)?;
-        self.active_toasts.insert(notification.tag, toast);
+        let mut toasts = self.active_toasts.borrow_mut();
+        toasts.insert(notification.tag, (serial, toast));
+        // Only a click removes a toast from the action center by itself; one the
+        // user swiped away stays there, so it stays here to be hidden by `dismiss`.
+        // Bound what an app with many tags keeps.
+        if toasts.len() > MAX_ACTIVE_TOASTS {
+            if let Some(oldest) = toasts
+                .iter()
+                .min_by_key(|(_, (serial, _))| *serial)
+                .map(|(tag, _)| tag.clone())
+            {
+                toasts.remove(&oldest);
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn dismiss(&mut self, tag: &str) {
-        let Some(toast) = self.active_toasts.remove(tag) else {
+        let Some((_, toast)) = self.active_toasts.borrow_mut().remove(tag) else {
             return;
         };
         let Some(notifier) = &self.notifier else {
@@ -111,8 +150,22 @@ impl SystemNotificationState {
 
         if let Some(mut receiver) = self.response_receiver.take() {
             let callback = self.callback.clone();
+            let active_toasts = self.active_toasts.clone();
             self._response_task = Some(executor.spawn(async move {
-                while let Some(response) = receiver.next().await {
+                while let Some(event) = receiver.next().await {
+                    let response = match event {
+                        ToastEvent::Response(response) => response,
+                        ToastEvent::Gone { tag, serial } => {
+                            let mut toasts = active_toasts.borrow_mut();
+                            if toasts
+                                .get(&tag)
+                                .is_some_and(|(current, _)| *current == serial)
+                            {
+                                toasts.remove(&tag);
+                            }
+                            continue;
+                        }
+                    };
                     // Take the callback out for the call: it may re-enter the
                     // platform (e.g. to dismiss the notification it was told
                     // about) or replace itself.
@@ -182,7 +235,13 @@ fn toast_document(notification: &SystemNotification) -> windows::core::Result<Xm
     }
 
     // No <audio> element: Windows plays its default notification sound, like
-    // the macOS notification Kybern posts, and Focus Assist silences it.
+    // the macOS notification Kybern posts, and Focus Assist silences it. A
+    // `silent` post (a replacement the user just heard) turns the sound off.
+    if notification.silent {
+        let audio = document.CreateElement(h!("audio"))?;
+        audio.SetAttribute(h!("silent"), h!("true"))?;
+        toast.AppendChild(&audio)?;
+    }
     Ok(document)
 }
 
