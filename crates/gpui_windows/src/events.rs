@@ -119,6 +119,7 @@ impl WindowsWindowInner {
             // behavior of toggling whether the window is maximized.
             WM_NCLBUTTONDBLCLK | WM_NCLBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
+                    .or_else(|| self.run_caption_press(handle, msg, wparam, lparam))
             }
             WM_NCRBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Right, wparam, lparam)
@@ -1093,6 +1094,33 @@ impl WindowsWindowInner {
         } else {
             None
         }
+    }
+
+    /// A left press GPUI did not take on the caption or a border: `DefWindowProc` runs Windows'
+    /// own handling (the move or size loop, the double-click maximize) here, and then GPUI gets
+    /// the release the loop consumed. Without it the `MouseDown` dispatched for the press stays
+    /// open in GPUI (an element that captured it keeps the pointer), and clicks after a window
+    /// drag are lost. A double click returns with the button still down; its own release follows.
+    fn run_caption_press(&self, handle: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        let result = unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
+        if unsafe { GetKeyState(VK_LBUTTON.0 as i32) } >= 0
+            && let Some(mut func) = self.state.callbacks.input.take()
+        {
+            let mut cursor = POINT::default();
+            unsafe {
+                GetCursorPos(&mut cursor).log_err();
+                ScreenToClient(handle, &mut cursor).ok().log_err();
+            }
+            let scale_factor = self.state.scale_factor.get();
+            func(PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: logical_point(cursor.x as f32, cursor.y as f32, scale_factor),
+                modifiers: current_modifiers(),
+                click_count: self.state.click_state.current_count.get(),
+            }));
+            self.state.callbacks.input.set(Some(func));
+        }
+        Some(result.0)
     }
 
     fn handle_nc_mouse_up_msg(
