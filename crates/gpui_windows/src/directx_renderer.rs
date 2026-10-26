@@ -1042,7 +1042,11 @@ impl DirectXRenderPipelines {
 impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
-        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // Not topmost: a window has one topmost and one non-topmost composition target, and Kybern's embedded web
+        // view (WebView2 under a Windows.UI.Composition `DesktopWindowTarget`, apps/gpuix/WEBVIEW-PLATFORMS.md)
+        // takes the topmost one to draw pages above this swap chain. GPUI has no child windows, so nothing else
+        // changes. Topmost here makes that target fail with DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED.
+        let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, false) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {

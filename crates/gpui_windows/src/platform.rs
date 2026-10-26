@@ -360,6 +360,12 @@ fn translate_accelerator(msg: &MSG) -> Option<()> {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return None;
     }
+    // Only GPUI's own windows answer WM_GPUI_KEYDOWN. Any other window on this thread (an embedded WebView2's input
+    // window, apps/gpuix/WEBVIEW-PLATFORMS.md) returns 0 for an unknown message, which would read as "handled" and
+    // drop the key before TranslateMessage/DispatchMessage: typing into the page would never arrive.
+    if !is_gpui_window(msg.hwnd) {
+        return None;
+    }
 
     let result = unsafe {
         SendMessageW(
@@ -370,6 +376,13 @@ fn translate_accelerator(msg: &MSG) -> Option<()> {
         )
     };
     (result.0 == 0).then_some(())
+}
+
+fn is_gpui_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let length = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    let expected = unsafe { WINDOW_CLASS_NAME.as_wide() };
+    length > 0 && class[..length] == *expected
 }
 
 fn encode_restart_arguments(arguments: &[OsString]) -> OsString {

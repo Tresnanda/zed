@@ -34,8 +34,7 @@ struct ContentMask {
     uint clip_generation;
 };
 
-// Same 40-byte record as gpui's `RoundedClip` and shaders.metal: `kind` 0 is a rounded rectangle, anything else an
-// edge fade whose `radii` are the top, right, bottom and left ramp widths.
+// `gpui::RoundedClip`, 40 bytes (the buffer's stride): a rounded clip (`kind` 0) or an edge fade (1).
 struct RoundedClipNode {
     float4 bounds;
     float4 radii;
@@ -43,18 +42,19 @@ struct RoundedClipNode {
     uint kind;
 };
 
-float edge_fade_alpha(float2 p, float2 lo, float2 size, float4 band) {
-    float4 d = float4(p.y - lo.y, lo.x + size.x - p.x, lo.y + size.y - p.y, p.x - lo.x);
-    float4 r = band > 0.0 ? saturate(d / max(band, 1e-4)) : 1.0;
-    float m = min(min(r.x, r.y), min(r.z, r.w));
-    return m * m;
-}
-
 StructuredBuffer<RoundedClipNode> rounded_clips: register(t2);
 
 // Coverage of `p` inside rounded chain `id` (0 = rectangular); see shaders.metal.
 // The shaders compile for ps_4_1, which has no structured-buffer GetDimensions:
 // every id indexes a chain written this frame, and links are capped at 64.
+// Edge fade link: ramps are top, right, bottom, left; 0 leaves that edge alone.
+float edge_fade_alpha(float2 p, float2 lo, float2 size, float4 band) {
+    float4 d = float4(p.y - lo.y, lo.x + size.x - p.x, lo.y + size.y - p.y, p.x - lo.x);
+    float4 r = band > 0.0 ? saturate(d / max(band, 1e-4)) : float4(1.0, 1.0, 1.0, 1.0);
+    float m = min(min(r.x, r.y), min(r.z, r.w));
+    return m * m;
+}
+
 float rounded_clip_alpha(float2 p, uint id) {
     float coverage = 1.0;
     float fade = 1.0;
@@ -63,6 +63,7 @@ float rounded_clip_alpha(float2 p, uint id) {
         RoundedClipNode n = rounded_clips[id];
         float2 lo = n.bounds.xy;
         float2 size = n.bounds.zw;
+        // Edge fades multiply, so nested scopes compound (shaders.metal).
         if (n.kind != 0) {
             fade *= edge_fade_alpha(p, lo, size, n.radii);
             id = n.parent;
@@ -79,6 +80,9 @@ float rounded_clip_alpha(float2 p, uint id) {
         }
         coverage = min(coverage, saturate(0.5 - distance));
         id = n.parent;
+    }
+    if (fade <= 0.0) {
+        return 0.0;
     }
     return coverage * fade;
 }

@@ -111,20 +111,12 @@ struct ContentMask {
     clip_generation: u32,
 }
 
-// Same 40-byte record as gpui's `RoundedClip` and shaders.metal: `kind` 0 is a rounded rectangle, anything else an
-// edge fade whose `radii` are the top, right, bottom and left ramp widths.
+// `gpui::RoundedClip`, 40 bytes: a rounded clip (`kind` 0) or an edge fade (1).
 struct RoundedClipNode {
     bounds: array<f32, 4>,
     radii: array<f32, 4>,
     parent: u32,
     kind: u32,
-}
-
-fn edge_fade_alpha(p: vec2<f32>, lo: vec2<f32>, size: vec2<f32>, band: vec4<f32>) -> f32 {
-    let d = vec4<f32>(p.y - lo.y, lo.x + size.x - p.x, lo.y + size.y - p.y, p.x - lo.x);
-    let r = select(vec4<f32>(1.0), saturate(d / max(band, vec4<f32>(0.0001))), band > vec4<f32>(0.0));
-    let m = min(min(r.x, r.y), min(r.z, r.w));
-    return m * m;
 }
 
 // Rounded-clip coverage on a fragment colour in this pass's blending convention.
