@@ -1836,11 +1836,12 @@ impl Window {
             let last = Rc::new(Cell::new(None));
             Box::new(move || {
                 let answer = handle.update(&mut cx, |_, window, _cx| {
-                    // A fresh hit test where the pointer is now: `mouse_hit_test` is only as new as
-                    // the last mouse event GPUI dispatched, and Windows asks before it sends the
-                    // move or press that would update it. The topmost area wins, so a control
+                    // A fresh hit test at the point the platform asks about (`WM_NCHITTEST`'s, not
+                    // the cursor's: a touch or pen tap moves no cursor): `mouse_hit_test` is only as
+                    // new as the last mouse event GPUI dispatched, and Windows asks before it sends
+                    // the move or press that would update it. The topmost area wins, so a control
                     // (`Client`) inside a drag area is not part of the caption.
-                    let hit = window.rendered_frame.hit_test(window.platform_window.mouse_position());
+                    let hit = window.rendered_frame.hit_test(window.platform_window.hit_test_position());
                     let areas = &window.rendered_frame.window_control_hitboxes;
                     for id in &hit.ids {
                         if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
@@ -5508,12 +5509,26 @@ impl Window {
     /// Dispatch a given keystroke as though the user had typed it.
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
-        let keystroke = keystroke.with_simulated_ime();
+        self.dispatch_key_down(
+            KeyDownEvent {
+                keystroke,
+                is_held: false,
+                prefer_character_input: false,
+            },
+            cx,
+        )
+    }
+
+    /// Dispatch a key-down event again (an app that held a key back and lets it through), its
+    /// `prefer_character_input` included: AltGr text on Windows arrives as ctrl-alt, and must reach
+    /// the text field rather than a ctrl-alt binding. Inserts the key's character when nothing
+    /// handled the event, as `dispatch_keystroke` does.
+    pub fn dispatch_key_down(&mut self, event: KeyDownEvent, cx: &mut App) -> bool {
+        let keystroke = event.keystroke.with_simulated_ime();
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
-                is_held: false,
-                prefer_character_input: false,
+                ..event
             }),
             cx,
         );

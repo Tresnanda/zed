@@ -914,6 +914,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Kybern: the point a window-control hit test is about, in window coordinates. Windows sends it
+    /// with `WM_NCHITTEST`; a touch or pen tap, or another sender, is not where the cursor is.
+    fn hit_test_position(&self) -> Point<Pixels> {
+        self.mouse_position()
+    }
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);

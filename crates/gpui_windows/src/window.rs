@@ -77,6 +77,8 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
+    /// The `WM_NCHITTEST` point while its hit test runs (logical, window coordinates).
+    pub hit_test_point: Cell<Option<Point<Pixels>>>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -178,6 +180,7 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            hit_test_point: Cell::new(None),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -673,6 +676,14 @@ impl PlatformWindow for WindowsWindow {
             point
         };
         logical_point(point.x as f32, point.y as f32, scale_factor)
+    }
+
+    fn hit_test_position(&self) -> Point<Pixels> {
+        self.0
+            .state
+            .hit_test_point
+            .get()
+            .unwrap_or_else(|| self.mouse_position())
     }
 
     fn modifiers(&self) -> Modifiers {

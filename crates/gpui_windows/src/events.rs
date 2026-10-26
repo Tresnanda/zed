@@ -119,10 +119,11 @@ impl WindowsWindowInner {
             // behavior of toggling whether the window is maximized.
             WM_NCLBUTTONDBLCLK | WM_NCLBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
-                    .or_else(|| self.run_caption_press(handle, msg, wparam, lparam))
+                    .or_else(|| self.run_caption_press(handle, MouseButton::Left, msg, wparam, lparam))
             }
             WM_NCRBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Right, wparam, lparam)
+                    .or_else(|| self.run_caption_press(handle, MouseButton::Right, msg, wparam, lparam))
             }
             WM_NCMBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Middle, wparam, lparam)
@@ -962,9 +963,24 @@ impl WindowsWindowInner {
             return None;
         }
 
+        // The point Windows asks about, which for a touch or pen tap (or any sender) need not be
+        // where the cursor is: GPUI hit-tests it through `hit_test_position`.
+        let mut cursor_point = POINT {
+            x: lparam.signed_loword().into(),
+            y: lparam.signed_hiword().into(),
+        };
+        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
+        let scale_factor = self.state.scale_factor.get();
+
         let callback = self.state.callbacks.hit_test_window_control.take();
         let drag_area = if let Some(mut callback) = callback {
+            self.state.hit_test_point.set(Some(logical_point(
+                cursor_point.x as f32,
+                cursor_point.y as f32,
+                scale_factor,
+            )));
             let area = callback();
+            self.state.hit_test_point.set(None);
             self.state
                 .callbacks
                 .hit_test_window_control
@@ -995,12 +1011,6 @@ impl WindowsWindowInner {
         // We need to calculate the frame thickness ourselves and do the hit test manually.
         let frame_y = get_frame_thicknessx(dpi);
         let frame_x = get_frame_thicknessy(dpi);
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
-
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         if self.is_resizable
             && !self.state.is_maximized()
             && 0 <= cursor_point.y
@@ -1096,14 +1106,16 @@ impl WindowsWindowInner {
         }
     }
 
-    /// A left press GPUI did not take on the caption or a border: `DefWindowProc` runs Windows'
-    /// own handling (the move or size loop, the double-click maximize) here, and then GPUI gets
-    /// the release the loop consumed. Without it the `MouseDown` dispatched for the press stays
-    /// open in GPUI (an element that captured it keeps the pointer), and clicks after a window
-    /// drag are lost. A double click returns with the button still down; its own release follows.
-    fn run_caption_press(&self, handle: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    /// A left or right press GPUI did not take on the caption or a border: `DefWindowProc` runs
+    /// Windows' own handling (the move or size loop, the double-click maximize, the system menu
+    /// on a right click) here, and then GPUI gets the release that handling consumed. Without it
+    /// the `MouseDown` dispatched for the press stays open in GPUI (an element that captured it
+    /// keeps the pointer), and clicks after a window drag are lost. When it returns with the
+    /// button still down (a double click's maximize), the release arrives itself.
+    fn run_caption_press(&self, handle: HWND, button: MouseButton, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let result = unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
-        if unsafe { GetKeyState(VK_LBUTTON.0 as i32) } >= 0
+        let key = if button == MouseButton::Right { VK_RBUTTON } else { VK_LBUTTON };
+        if unsafe { GetKeyState(key.0 as i32) } >= 0
             && let Some(mut func) = self.state.callbacks.input.take()
         {
             let mut cursor = POINT::default();
@@ -1113,7 +1125,7 @@ impl WindowsWindowInner {
             }
             let scale_factor = self.state.scale_factor.get();
             func(PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
+                button,
                 position: logical_point(cursor.x as f32, cursor.y as f32, scale_factor),
                 modifiers: current_modifiers(),
                 click_count: self.state.click_state.current_count.get(),
@@ -1244,6 +1256,15 @@ impl WindowsWindowInner {
             // system settings may emit a window message which wants to take the refcell self.state, so drop it
 
             self.system_settings().update(wparam.0);
+            // Kybern: "Animation effects" (Settings › Accessibility › Visual effects) has no
+            // observer of its own; appearance observers re-read it with the rest of the
+            // window's look, so a change arrives while the app runs.
+            if wparam.0 == SPI_SETCLIENTAREAANIMATION.0 as usize
+                && let Some(mut callback) = self.state.callbacks.appearance_changed.take()
+            {
+                callback();
+                self.state.callbacks.appearance_changed.set(Some(callback));
+            }
         } else {
             self.handle_system_theme_changed(handle, lparam)?;
         };
