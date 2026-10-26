@@ -2180,7 +2180,7 @@ impl WgpuRenderer {
         let clips = if clips.is_empty() {
             &zero[..]
         } else if std::env::var("KYBERN_ROUNDED_CLIP").is_ok_and(|value| value == "0") {
-            square = clips.iter().map(|clip| gpui::RoundedClip { radii: [0.0; 4], ..*clip }).collect();
+            square = clips.iter().map(|clip| if clip.kind == 0 { gpui::RoundedClip { radii: [0.0; 4], ..*clip } } else { *clip }).collect();
             &square[..]
         } else {
             clips
