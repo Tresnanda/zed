@@ -1357,40 +1357,50 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 }
 
 // --- surfaces --- //
-// RGBA texture composite. Ported from gpui-ce
-// https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477
+// A wgpu texture composited in the scene (gpui-ce #39/#121). Kybern: drawn like a polychrome sprite (instance
+// record, rounded clip chain, opacity) from its own texture bound where the sprite atlas goes. The texels are
+// premultiplied (WPE WebKit's offscreen frames).
 
-struct SurfaceParams {
+struct SurfaceInstance {
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
+    opacity: f32,
+    pad: u32,
 }
-
-@group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
-@group(1) @binding(1) var t_surface: texture_2d<f32>;
-@group(1) @binding(2) var s_surface: sampler;
 
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) opacity: f32,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) rounded_clip: u32,
 }
 
 @vertex
-fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
+fn vs_surface(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> SurfaceVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let surface = load_surface(instance_id);
 
     var out = SurfaceVarying();
-    out.position = to_device_position(unit_vertex, surface_locals.bounds);
+    out.position = to_device_position(unit_vertex, surface.bounds);
     out.texture_position = unit_vertex;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
+    out.opacity = surface.opacity;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask.bounds);
+    out.rounded_clip = surface.content_mask.rounded_clip;
     return out;
 }
 
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.texture_position);
+    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
+        return apply_rounded_clip(vec4<f32>(0.0), rounded_clip_alpha(input.position.xy, input.rounded_clip));
     }
-
-    return textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0);
+    let coverage = input.opacity * rounded_clip_alpha(input.position.xy, input.rounded_clip);
+    if (globals.premultiplied_alpha != 0u) {
+        return sample * coverage;
+    }
+    let straight = select(vec3<f32>(0.0), sample.rgb / max(sample.a, 0.00001), sample.a > 0.0);
+    return vec4<f32>(straight, sample.a * coverage);
 }

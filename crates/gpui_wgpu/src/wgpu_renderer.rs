@@ -80,9 +80,20 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceParams {
+struct PodContentMask {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    rounded_clip: u32,
+    clip_generation: u32,
+}
+
+/// `SurfaceInstance` in shaders.wgsl: a texture drawn like a polychrome sprite.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SurfaceInstance {
+    bounds: PodBounds,
+    content_mask: PodContentMask,
+    opacity: f32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -155,13 +166,13 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    surfaces: InstanceBinding,
 }
 
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
-    surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -189,10 +200,6 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
-    #[allow(dead_code)]
-    surface_sampler: wgpu::Sampler,
-    #[allow(dead_code)]
-    surface_uniform_buffer: wgpu::Buffer,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -514,20 +521,6 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        let surface_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("surface_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let surface_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("surface_uniform_buffer"),
-            size: std::mem::size_of::<SurfaceParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -646,8 +639,6 @@ impl WgpuRenderer {
             pipelines,
             bind_group_layouts,
             atlas_sampler,
-            surface_sampler,
-            surface_uniform_buffer,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -783,45 +774,10 @@ impl WgpuRenderer {
             ],
         });
 
-        let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("surfaces_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<SurfaceParams>() as u64
-                        ),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
-            surfaces,
         }
     }
 
@@ -1131,8 +1087,8 @@ impl WgpuRenderer {
             "vs_surface",
             "fs_surface",
             &layouts.globals,
-            &layouts.surfaces,
-            None,
+            &layouts.instances,
+            Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -1843,9 +1799,12 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    PrimitiveBatch::Surfaces(range) => {
-                        self.draw_surfaces(&scene.surfaces[range], &mut pass)
-                    }
+                    PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                        &instance_bindings.surfaces,
+                        &scene.surfaces,
+                        instance_range(range),
+                        &mut pass,
+                    ),
                 }
             }
         }
@@ -1856,58 +1815,44 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    // Ported from gpui-ce #39 / #121: sample an RGBA wgpu texture in the scene.
+    // Ported from gpui-ce #39 / #121: sample a wgpu texture in the scene, one draw per surface (each has its own
+    // texture), with the instance record carrying bounds, the rounded clip chain and opacity.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn draw_surfaces(&self, surfaces: &[gpui::PaintSurface], pass: &mut wgpu::RenderPass<'_>) {
+    fn draw_surfaces(
+        &self,
+        instances: &InstanceBinding,
+        surfaces: &[gpui::PaintSurface],
+        range: Range<u32>,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
         let resources = self.resources();
-        for surface in surfaces {
-            let Some(wgpu_texture) = surface.texture.downcast_ref::<wgpu::Texture>() else {
+        for index in range {
+            let Some(surface) = surfaces.get(index as usize) else {
                 continue;
             };
-
-            let texture_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let params = SurfaceParams {
-                bounds: surface.bounds.into(),
-                content_mask: surface.content_mask.bounds.into(),
+            let Some(texture) = surface.texture.downcast_ref::<wgpu::Texture>() else {
+                continue;
             };
-
-            resources.queue.write_buffer(
-                &resources.surface_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&params),
-            );
-
-            let bind_group = resources
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("surface_bind_group"),
-                    layout: &resources.bind_group_layouts.surfaces,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: resources.surface_uniform_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&texture_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&resources.surface_sampler),
-                        },
-                    ],
-                });
-
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.create_texture_bind_group("surface_texture_bind_group", &view);
             pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
-            pass.set_bind_group(1, &bind_group, &[]);
-            pass.draw(0..4, 0..1);
+            pass.set_bind_group(1, &instances.bind_group, &[]);
+            pass.set_bind_group(2, &bind_group, &[]);
+            let instance = instances.first_instance + index;
+            pass.draw(0..4, instance..instance + 1);
         }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    fn draw_surfaces(&self, _surfaces: &[gpui::PaintSurface], _pass: &mut wgpu::RenderPass<'_>) {}
+    fn draw_surfaces(
+        &self,
+        _instances: &InstanceBinding,
+        _surfaces: &[gpui::PaintSurface],
+        _range: Range<u32>,
+        _pass: &mut wgpu::RenderPass<'_>,
+    ) {
+    }
 
     fn write_instances(
         &mut self,
@@ -1944,6 +1889,24 @@ impl WgpuRenderer {
                 "polychrome_sprites_bind_group",
                 instance_offset,
                 &scene.polychrome_sprites,
+            )?,
+            surfaces: self.write_instance_binding(
+                "surfaces_bind_group",
+                instance_offset,
+                &scene
+                    .surfaces
+                    .iter()
+                    .map(|surface| SurfaceInstance {
+                        bounds: surface.bounds.into(),
+                        content_mask: PodContentMask {
+                            bounds: surface.content_mask.bounds.into(),
+                            rounded_clip: surface.content_mask.rounded_clip,
+                            clip_generation: surface.content_mask.clip_generation,
+                        },
+                        opacity: surface.opacity,
+                        pad: 0,
+                    })
+                    .collect::<Vec<_>>(),
             )?,
         })
     }

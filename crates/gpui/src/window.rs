@@ -4962,10 +4962,12 @@ impl Window {
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            opacity,
             image_buffer,
         });
     }
@@ -4989,13 +4991,16 @@ impl Window {
 
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
-        let content_mask = self.content_mask().scale(scale_factor);
+        // Snapped like images, so a page sits on whole device pixels and its rounded clip chain is the one
+        // every other primitive in this content mask uses.
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            opacity,
             texture,
             texture_size,
         });

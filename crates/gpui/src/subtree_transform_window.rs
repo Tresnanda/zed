@@ -493,6 +493,7 @@ impl crate::scene::Primitive {
             }
             Self::Surface(p) => {
                 rect(&mut p.bounds);
+                p.opacity *= opacity;
                 p.content_mask = mask;
             }
             Self::Path(p) => {

@@ -210,6 +210,7 @@ mod tests {
                         size(ScaledPixels(64.), ScaledPixels(64.)),
                     ),
                 },
+                opacity: 1.,
                 texture: Arc::clone(&texture),
                 texture_size: size(DevicePixels(64), DevicePixels(64)),
             });

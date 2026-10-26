@@ -1046,6 +1046,9 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Kybern: the element opacity in effect when painted (fades, subtree opacity). The Linux texture is
+    /// premultiplied, as WPE WebKit renders it.
+    pub opacity: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     /// Type-erased GPU texture (`Arc<wgpu::Texture>`). Ported from gpui-ce
