@@ -12,6 +12,7 @@
 @group(1) @binding(0) var<storage, read> b_underlines: array<Underline>;
 @group(1) @binding(0) var<storage, read> b_mono_sprites: array<MonochromeSprite>;
 @group(1) @binding(0) var<storage, read> b_poly_sprites: array<PolychromeSprite>;
+@group(1) @binding(0) var<storage, read> b_surfaces: array<SurfaceInstance>;
 
 fn load_quad(instance_id: u32) -> Quad {
     return b_quads[instance_id];
@@ -41,6 +42,10 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return b_poly_sprites[instance_id];
 }
 
+fn load_surface(instance_id: u32) -> SurfaceInstance {
+    return b_surfaces[instance_id];
+}
+
 // Kybern: the scene's rounded clip chains (rounded_clip_gpui.py), shared by every pipeline.
 @group(1) @binding(1) var<storage, read> b_rounded_clips: array<RoundedClipNode>;
 
@@ -49,6 +54,7 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
 fn rounded_clip_alpha(p: vec2<f32>, chain: u32) -> f32 {
     var id = chain;
     var coverage = 1.0;
+    var fade = 1.0;
     loop {
         if (id == 0u || id >= arrayLength(&b_rounded_clips)) {
             break;
@@ -56,6 +62,11 @@ fn rounded_clip_alpha(p: vec2<f32>, chain: u32) -> f32 {
         let n = b_rounded_clips[id];
         let lo = vec2<f32>(n.bounds[0], n.bounds[1]);
         let size = vec2<f32>(n.bounds[2], n.bounds[3]);
+        if (n.kind != 0u) {
+            fade *= edge_fade_alpha(p, lo, size, vec4<f32>(n.radii[0], n.radii[1], n.radii[2], n.radii[3]));
+            id = n.parent;
+            continue;
+        }
         let right = p.x >= lo.x + size.x / 2.0;
         let bottom = p.y >= lo.y + size.y / 2.0;
         var r = n.radii[0];
@@ -71,5 +82,5 @@ fn rounded_clip_alpha(p: vec2<f32>, chain: u32) -> f32 {
         coverage = min(coverage, saturate(0.5 - distance));
         id = n.parent;
     }
-    return coverage;
+    return coverage * fade;
 }

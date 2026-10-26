@@ -34,11 +34,21 @@ struct ContentMask {
     uint clip_generation;
 };
 
+// Same 40-byte record as gpui's `RoundedClip` and shaders.metal: `kind` 0 is a rounded rectangle, anything else an
+// edge fade whose `radii` are the top, right, bottom and left ramp widths.
 struct RoundedClipNode {
     float4 bounds;
     float4 radii;
     uint parent;
+    uint kind;
 };
+
+float edge_fade_alpha(float2 p, float2 lo, float2 size, float4 band) {
+    float4 d = float4(p.y - lo.y, lo.x + size.x - p.x, lo.y + size.y - p.y, p.x - lo.x);
+    float4 r = band > 0.0 ? saturate(d / max(band, 1e-4)) : 1.0;
+    float m = min(min(r.x, r.y), min(r.z, r.w));
+    return m * m;
+}
 
 StructuredBuffer<RoundedClipNode> rounded_clips: register(t2);
 
@@ -47,11 +57,17 @@ StructuredBuffer<RoundedClipNode> rounded_clips: register(t2);
 // every id indexes a chain written this frame, and links are capped at 64.
 float rounded_clip_alpha(float2 p, uint id) {
     float coverage = 1.0;
+    float fade = 1.0;
     [loop]
     for (uint link = 0; link < 64 && id != 0; link++) {
         RoundedClipNode n = rounded_clips[id];
         float2 lo = n.bounds.xy;
         float2 size = n.bounds.zw;
+        if (n.kind != 0) {
+            fade *= edge_fade_alpha(p, lo, size, n.radii);
+            id = n.parent;
+            continue;
+        }
         bool right = p.x >= lo.x + size.x / 2.0;
         bool bottom = p.y >= lo.y + size.y / 2.0;
         float r = bottom ? (right ? n.radii.z : n.radii.w) : (right ? n.radii.y : n.radii.x);
@@ -64,7 +80,7 @@ float rounded_clip_alpha(float2 p, uint id) {
         coverage = min(coverage, saturate(0.5 - distance));
         id = n.parent;
     }
-    return coverage;
+    return coverage * fade;
 }
 
 float4 apply_rounded_clip(float4 color, float coverage) {
