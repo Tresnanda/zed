@@ -1508,7 +1508,37 @@ impl WgpuRenderer {
         self.ensure_intermediate_textures();
         self.ensure_readback(width, height);
         self.write_globals();
+        self.read_back(scene, width, height, pixels)
+    }
 
+    /// Kybern: renders `scene` offscreen at the surface's current size and
+    /// returns it as tightly packed RGBA rows without presenting. This is the
+    /// automation screenshot on Linux: it reads the scene, not the window, so it
+    /// works under Xvfb and headless compositors alike.
+    pub fn render_to_rgba(&mut self, scene: &Scene) -> Result<(u32, u32, Vec<u8>)> {
+        anyhow::ensure!(!self.device_lost(), "the GPU device was lost");
+        let width = self.surface_config.width.max(1).min(self.max_texture_size);
+        let height = self.surface_config.height.max(1).min(self.max_texture_size);
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+        self.ensure_readback(width, height);
+        self.write_globals();
+        self.read_back(scene, width, height, &mut pixels)?;
+        if matches!(
+            self.surface_config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok((width, height, pixels))
+    }
+
+    /// Records `scene` into the readback target and copies it into `pixels`.
+    fn read_back(&mut self, scene: &Scene, width: u32, height: u32, pixels: &mut [u8]) -> Result<()> {
+        let unpadded_bytes_per_row = width * 4;
         let view = self
             .resources()
             .readback
@@ -2150,7 +2180,7 @@ impl WgpuRenderer {
         let clips = if clips.is_empty() {
             &zero[..]
         } else if std::env::var("KYBERN_ROUNDED_CLIP").is_ok_and(|value| value == "0") {
-            square = clips.iter().map(|clip| gpui::RoundedClip { radii: [0.0; 4], ..*clip }).collect();
+            square = clips.iter().map(|clip| if clip.kind == 0 { gpui::RoundedClip { radii: [0.0; 4], ..*clip } } else { *clip }).collect();
             &square[..]
         } else {
             clips

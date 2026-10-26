@@ -540,7 +540,7 @@ impl DirectXRenderer {
         let clips = if clips.is_empty() {
             &zero[..]
         } else if rounded_clips_disabled() {
-            square = clips.iter().map(|clip| gpui::RoundedClip { radii: [0.0; 4], ..*clip }).collect();
+            square = clips.iter().map(|clip| if clip.kind == 0 { gpui::RoundedClip { radii: [0.0; 4], ..*clip } } else { *clip }).collect();
             &square[..]
         } else {
             clips
