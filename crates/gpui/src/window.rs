@@ -1168,6 +1168,8 @@ const KEYBOARD_MODALITY_MOUSE_SLOP: Pixels = px(8.);
 
 /// Holds the state for a specific window.
 pub struct Window {
+    #[cfg(not(target_os = "macos"))]
+    kybern_frame_counters: std::sync::Arc<crate::platform::FrameCounters>,
     kybern_motion_frame_epoch: u64,
     pub(crate) kybern_prepaint_rollback_epoch: u64,
     pub(crate) handle: AnyWindowHandle,
@@ -1484,6 +1486,8 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        #[cfg(not(target_os = "macos"))]
+        let frame_counters = std::sync::Arc::new(crate::platform::FrameCounters::default());
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1596,6 +1600,8 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            #[cfg(not(target_os = "macos"))]
+            let frame_counters = frame_counters.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
@@ -1671,7 +1677,9 @@ impl Window {
 
                 let pending_next_frame_callbacks = next_frame_callbacks.take();
                 #[cfg(not(target_os = "macos"))]
-                let mut served = !pending_next_frame_callbacks.is_empty();
+                let ran_callbacks = !pending_next_frame_callbacks.is_empty();
+                #[cfg(not(target_os = "macos"))]
+                let mut drawn = false;
                 if !pending_next_frame_callbacks.is_empty() {
                     handle
                         .update(&mut cx, |_, window, cx| {
@@ -1692,7 +1700,7 @@ impl Window {
                 if invalidator.is_dirty() || force_render {
                     #[cfg(not(target_os = "macos"))]
                     {
-                        served = true;
+                        drawn = true;
                     }
                     measure("frame duration", || {
                         handle
@@ -1734,7 +1742,13 @@ impl Window {
                 }
 
                 #[cfg(not(target_os = "macos"))]
-                if served {
+                if drawn || ran_callbacks {
+                    let counter = if drawn {
+                        &frame_counters.drawn
+                    } else {
+                        &frame_counters.callbacks_only
+                    };
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     crate::platform::frame_served();
                 }
             }
@@ -1885,6 +1899,8 @@ impl Window {
         platform_window.map_window().unwrap();
 
         Ok(Window {
+            #[cfg(not(target_os = "macos"))]
+            kybern_frame_counters: frame_counters,
             kybern_motion_frame_epoch: 0,
             kybern_prepaint_rollback_epoch: 0,
             handle,
@@ -2600,6 +2616,12 @@ impl Window {
     /// Regions currently obscured by system UI, including the software keyboard.
     pub fn insets(&self) -> WindowInsets {
         self.platform_window.insets()
+    }
+
+    /// Kybern: this window's served-frame counters off macOS (see `FrameCounters`).
+    #[cfg(not(target_os = "macos"))]
+    pub fn frame_counters(&self) -> std::sync::Arc<crate::platform::FrameCounters> {
+        self.kybern_frame_counters.clone()
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
