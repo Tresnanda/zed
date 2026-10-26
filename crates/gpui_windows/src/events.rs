@@ -78,6 +78,37 @@ impl Drop for DrawWindowGuard<'_> {
     }
 }
 
+/// Kybern: the window menu (Restore, Move, Size, Minimize, Maximize, Close) at a screen point, with
+/// its items enabled for the window's state as `DefWindowProc` would; the chosen command runs as
+/// WM_SYSCOMMAND. Also `PlatformWindow::show_window_menu`.
+pub(crate) fn show_system_menu(handle: HWND, screen: POINT) {
+    unsafe {
+        let menu = GetSystemMenu(handle, false);
+        if menu.is_invalid() {
+            return;
+        }
+        let maximized = IsZoomed(handle).as_bool();
+        let minimized = IsIconic(handle).as_bool();
+        let style = get_window_long(handle, GWL_STYLE) as u32;
+        let resizable = style & WS_THICKFRAME.0 != 0;
+        let set = |item: u32, enabled: bool| {
+            let _ = EnableMenuItem(menu, item, MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED });
+        };
+        set(SC_RESTORE, maximized || minimized);
+        set(SC_MOVE, !maximized && !minimized);
+        set(SC_SIZE, resizable && !maximized && !minimized);
+        set(SC_MINIMIZE, style & WS_MINIMIZEBOX.0 != 0 && !minimized);
+        set(SC_MAXIMIZE, resizable && style & WS_MAXIMIZEBOX.0 != 0 && !maximized);
+        set(SC_CLOSE, true);
+        let _ = SetMenuDefaultItem(menu, SC_CLOSE, 0);
+        let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN;
+        let command = TrackPopupMenu(menu, flags, screen.x, screen.y, None, handle, None);
+        if command.0 != 0 {
+            PostMessageW(Some(handle), WM_SYSCOMMAND, WPARAM(command.0 as usize), LPARAM(0)).log_err();
+        }
+    }
+}
+
 impl WindowsWindowInner {
     pub(crate) fn handle_msg(
         self: &Rc<Self>,
@@ -1131,6 +1162,12 @@ impl WindowsWindowInner {
                 click_count: self.state.click_state.current_count.get(),
             }));
             self.state.callbacks.input.set(Some(func));
+            // Kybern: the release was consumed, so no WM_NCRBUTTONUP follows to open the menu.
+            if button == MouseButton::Right && wparam.0 as u32 == HTCAPTION {
+                let mut cursor = POINT::default();
+                unsafe { GetCursorPos(&mut cursor).log_err() };
+                show_system_menu(handle, cursor);
+            }
         }
         Some(result.0)
     }
@@ -1159,10 +1196,19 @@ impl WindowsWindowInner {
             let handled = !func(input).propagate;
             self.state.callbacks.input.set(Some(func));
 
-            if handled {
+            if handled && !(button == MouseButton::Right && wparam.0 as u32 == HTCAPTION) {
                 return Some(0);
             }
         } else {
+        }
+
+        // Kybern: a right click on the caption opens the window (system) menu. The window draws its
+        // own title bar, and `DefWindowProc` opens no menu for it here (seen on Windows 11: neither
+        // the release nor a WM_CONTEXTMENU did), so open it as Windows would and run the command.
+        // A control in the title bar answers HTCLIENT, so its own right click never comes here.
+        if button == MouseButton::Right && wparam.0 as u32 == HTCAPTION {
+            show_system_menu(handle, POINT { x: lparam.signed_loword().into(), y: lparam.signed_hiword().into() });
+            return Some(0);
         }
 
         let last_pressed = self.state.nc_button_pressed.take();

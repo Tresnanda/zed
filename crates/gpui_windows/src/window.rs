@@ -929,6 +929,16 @@ impl PlatformWindow for WindowsWindow {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
 
+    fn show_window_menu(&self, position: Point<Pixels>) {
+        let scale_factor = self.state.scale_factor.get();
+        let mut point = POINT {
+            x: (position.x.as_f32() * scale_factor).round() as i32,
+            y: (position.y.as_f32() * scale_factor).round() as i32,
+        };
+        unsafe { ClientToScreen(self.0.hwnd, &mut point).ok().log_err() };
+        show_system_menu(self.0.hwnd, point);
+    }
+
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
