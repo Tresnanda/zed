@@ -111,10 +111,12 @@ struct ContentMask {
     clip_generation: u32,
 }
 
+// `gpui::RoundedClip`, 40 bytes: a rounded clip (`kind` 0) or an edge fade (1).
 struct RoundedClipNode {
     bounds: array<f32, 4>,
     radii: array<f32, 4>,
     parent: u32,
+    kind: u32,
 }
 
 // Rounded-clip coverage on a fragment colour in this pass's blending convention.
