@@ -6601,6 +6601,12 @@ impl Window {
         self.platform_window.gpu_specs()
     }
 
+    /// Kybern: whether this window's renderer draws backdrop filters: Metal always; wgpu when its surface can be copied
+    /// from and it is not WebGL; Direct3D 11 always; none of them with `KYBERN_BACKDROP_FILTER=0` (off macOS).
+    pub fn backdrop_filter_supported(&self) -> bool {
+        self.platform_window.backdrop_filter_supported()
+    }
+
     /// Returns the GPU context (device + queue) if available.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
     ///

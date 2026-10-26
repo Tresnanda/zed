@@ -1920,6 +1920,10 @@ impl PlatformWindow for MacWindow {
         None
     }
 
+    fn backdrop_filter_supported(&self) -> bool {
+        true
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         let executor = self.0.lock().foreground_executor.clone();
         executor

@@ -3,8 +3,9 @@
 //
 // Per filter: copy the back buffer region behind it (the clip plus a 3-sigma halo) into a scratch, blur it horizontally
 // into a second scratch (half size for wide blurs, `KYBERN_BACKDROP_HALFRES=0` keeps full size), then draw the vertical
-// pass into the back buffer. The scratches are pooled like Metal's (N1): 64 px buckets, released after 30 frames without
-// a filter, re-created smaller when the last 120 frames needed under half their area.
+// pass into the back buffer. The two scratches are pooled apart, each like Metal's (N1): 64 px buckets, released after 30
+// frames without a filter, re-created smaller when the last 120 frames needed under half their area. The blur scratch is
+// sized by the largest `BackdropPlan::scratch_size`, a quarter of the copy at half resolution.
 
 use gpui::backdrop_kernel::{BackdropKernel, BackdropPlan};
 
@@ -25,13 +26,118 @@ struct BackdropParams {
     taps: [[f32; 4]; 49],
 }
 
-struct BackdropScratch {
-    copy: ID3D11Texture2D,
-    copy_view: Option<ID3D11ShaderResourceView>,
-    blur_target: Option<ID3D11RenderTargetView>,
-    blur_view: Option<ID3D11ShaderResourceView>,
+/// One pooled scratch texture and its views.
+struct BackdropTexture {
+    texture: ID3D11Texture2D,
+    view: Option<ID3D11ShaderResourceView>,
+    /// The blur scratch only.
+    target: Option<ID3D11RenderTargetView>,
+}
+
+struct BackdropPool {
+    texture: Option<BackdropTexture>,
     width: u32,
     height: u32,
+    created: u64,
+    requests: [(u32, u32); BACKDROP_SHRINK_FRAMES],
+}
+
+impl BackdropPool {
+    fn new() -> Self {
+        Self {
+            texture: None,
+            width: 0,
+            height: 0,
+            created: 0,
+            requests: [(0, 0); BACKDROP_SHRINK_FRAMES],
+        }
+    }
+
+    /// Record a `width` x `height` request for `frame` and return the size to re-create the texture at: only to grow,
+    /// or to shrink (see above).
+    fn resize(&mut self, frame: u64, width: u32, height: u32) -> Option<(u32, u32)> {
+        let slot = &mut self.requests[(frame % BACKDROP_SHRINK_FRAMES as u64) as usize];
+        *slot = (slot.0.max(width), slot.1.max(height));
+        if self.texture.is_none() {
+            return Some((backdrop_bucket(width), backdrop_bucket(height)));
+        }
+        if self.width < width || self.height < height {
+            return Some((
+                backdrop_bucket(width).max(self.width),
+                backdrop_bucket(height).max(self.height),
+            ));
+        }
+        if frame.saturating_sub(self.created) < BACKDROP_SHRINK_FRAMES as u64 {
+            return None;
+        }
+        let (most_width, most_height) = self
+            .requests
+            .iter()
+            .fold((0, 0), |(a, b), &(x, y)| (a.max(x), b.max(y)));
+        let (most_width, most_height) = (backdrop_bucket(most_width), backdrop_bucket(most_height));
+        let largest = self
+            .requests
+            .iter()
+            .map(|&(x, y)| u64::from(x) * u64::from(y))
+            .max()
+            .unwrap_or(0);
+        let area = u64::from(self.width) * u64::from(self.height);
+        (largest * 2 < area && u64::from(most_width) * u64::from(most_height) < area)
+            .then_some((most_width, most_height))
+    }
+
+    fn reserve(
+        &mut self,
+        device: &ID3D11Device,
+        frame: u64,
+        width: u32,
+        height: u32,
+        render_target: bool,
+    ) -> Result<()> {
+        let Some((width, height)) = self.resize(frame, width, height) else {
+            return Ok(());
+        };
+        self.texture = None;
+        let bind = if render_target {
+            D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0
+        } else {
+            D3D11_BIND_SHADER_RESOURCE.0
+        };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        let texture = texture.context("creating a backdrop scratch")?;
+        let (mut view, mut target) = (None, None);
+        unsafe {
+            device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+            if render_target {
+                device.CreateRenderTargetView(&texture, None, Some(&mut target))?;
+            }
+        }
+        self.texture = Some(BackdropTexture {
+            texture,
+            view,
+            target,
+        });
+        self.width = width;
+        self.height = height;
+        self.created = frame;
+        Ok(())
+    }
 }
 
 struct DirectXBackdrop {
@@ -42,15 +148,16 @@ struct DirectXBackdrop {
     params: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
     no_blend: ID3D11BlendState,
-    scratch: Option<BackdropScratch>,
+    /// The copied back buffer region (the largest crop).
+    copy: BackdropPool,
+    /// The horizontal pass's output.
+    blur: BackdropPool,
     frame: u64,
     last_draw: u64,
-    created: u64,
-    requests: [(u32, u32); BACKDROP_SHRINK_FRAMES],
 }
 
 /// `KYBERN_BACKDROP_FILTER=0` skips the filter (the translucent fill above it still paints): the before/after control.
-fn backdrop_filter_enabled() -> bool {
+pub(crate) fn backdrop_filter_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| !std::env::var("KYBERN_BACKDROP_FILTER").is_ok_and(|value| value == "0"))
@@ -109,94 +216,33 @@ impl DirectXBackdrop {
             params: create_constant_buffer::<BackdropParams>(device)?,
             sampler,
             no_blend,
-            scratch: None,
+            copy: BackdropPool::new(),
+            blur: BackdropPool::new(),
             frame: 0,
             last_draw: 0,
-            created: 0,
-            requests: [(0, 0); BACKDROP_SHRINK_FRAMES],
         })
     }
 
-    /// Once per frame, before its batches.
-    fn begin_frame(&mut self, has_backdrops: bool) {
+    /// Once per frame, before its batches. `last_draw` moves only when a filter was planned, so frames whose filters
+    /// all draw nothing (off screen, zero opacity) release the scratches too.
+    fn begin_frame(&mut self) {
         self.frame += 1;
-        self.requests[(self.frame % BACKDROP_SHRINK_FRAMES as u64) as usize] = (0, 0);
-        if !has_backdrops && self.frame.saturating_sub(self.last_draw) > BACKDROP_RELEASE_FRAMES {
-            self.scratch = None;
+        let slot = (self.frame % BACKDROP_SHRINK_FRAMES as u64) as usize;
+        self.copy.requests[slot] = (0, 0);
+        self.blur.requests[slot] = (0, 0);
+        if self.frame.saturating_sub(self.last_draw) > BACKDROP_RELEASE_FRAMES {
+            self.copy.texture = None;
+            self.blur.texture = None;
         }
     }
 
-    /// Size the scratches for a `width` x `height` crop: re-created only to grow or to shrink (see above).
-    fn reserve_scratch(&mut self, device: &ID3D11Device, width: u32, height: u32) -> Result<()> {
+    /// Size the scratches for `plan`.
+    fn reserve_scratch(&mut self, device: &ID3D11Device, plan: &BackdropPlan) -> Result<()> {
         self.last_draw = self.frame;
-        let slot = &mut self.requests[(self.frame % BACKDROP_SHRINK_FRAMES as u64) as usize];
-        *slot = (slot.0.max(width), slot.1.max(height));
-        let replace = match &self.scratch {
-            None => Some((backdrop_bucket(width), backdrop_bucket(height))),
-            Some(s) if s.width < width || s.height < height => Some((
-                backdrop_bucket(width).max(s.width),
-                backdrop_bucket(height).max(s.height),
-            )),
-            Some(s) if self.frame.saturating_sub(self.created) >= BACKDROP_SHRINK_FRAMES as u64 => {
-                let (most_width, most_height) = self
-                    .requests
-                    .iter()
-                    .fold((0, 0), |(a, b), &(x, y)| (a.max(x), b.max(y)));
-                let (most_width, most_height) =
-                    (backdrop_bucket(most_width), backdrop_bucket(most_height));
-                let largest = self
-                    .requests
-                    .iter()
-                    .map(|&(x, y)| u64::from(x) * u64::from(y))
-                    .max()
-                    .unwrap_or(0);
-                let area = u64::from(s.width) * u64::from(s.height);
-                (largest * 2 < area && u64::from(most_width) * u64::from(most_height) < area)
-                    .then_some((most_width, most_height))
-            }
-            Some(_) => None,
-        };
-        if let Some((width, height)) = replace {
-            self.scratch = None;
-            let texture = |bind: u32| -> Result<ID3D11Texture2D> {
-                let desc = D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: RENDER_TARGET_FORMAT,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: bind,
-                    CPUAccessFlags: 0,
-                    MiscFlags: 0,
-                };
-                let mut output = None;
-                unsafe { device.CreateTexture2D(&desc, None, Some(&mut output))? };
-                output.context("creating a backdrop scratch")
-            };
-            let copy = texture(D3D11_BIND_SHADER_RESOURCE.0 as u32)?;
-            let blur = texture((D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32)?;
-            let (mut copy_view, mut blur_view, mut blur_target) = (None, None, None);
-            unsafe {
-                device.CreateShaderResourceView(&copy, None, Some(&mut copy_view))?;
-                device.CreateShaderResourceView(&blur, None, Some(&mut blur_view))?;
-                device.CreateRenderTargetView(&blur, None, Some(&mut blur_target))?;
-            }
-            self.scratch = Some(BackdropScratch {
-                copy,
-                copy_view,
-                blur_target,
-                blur_view,
-                width,
-                height,
-            });
-            self.created = self.frame;
-        }
-        Ok(())
+        self.copy
+            .reserve(device, self.frame, plan.crop[2], plan.crop[3], false)?;
+        let (width, height) = plan.scratch_size();
+        self.blur.reserve(device, self.frame, width, height, true)
     }
 }
 
@@ -281,12 +327,14 @@ impl DirectXRenderer {
         let render_target_view = resources.render_target_view.clone();
         let backdrop_resources = self.backdrop.as_mut().context("backdrop filter missing")?;
         let [x, y, width, height] = plan.crop;
-        backdrop_resources.reserve_scratch(&devices.device, width, height)?;
+        backdrop_resources.reserve_scratch(&devices.device, &plan)?;
         let backdrop_resources = &*backdrop_resources;
-        let scratch = backdrop_resources
-            .scratch
-            .as_ref()
-            .context("backdrop scratch missing")?;
+        let (Some(copy), Some(blur)) = (
+            &backdrop_resources.copy.texture,
+            &backdrop_resources.blur.texture,
+        ) else {
+            return Ok(());
+        };
         let (blur_width, blur_height) = plan.scratch_size();
         let context = &devices.device_context;
         let params = backdrop_resources
@@ -295,7 +343,7 @@ impl DirectXRenderer {
             .context("backdrop parameters missing")?;
         unsafe {
             context.CopySubresourceRegion(
-                &scratch.copy,
+                &copy.texture,
                 0,
                 0,
                 0,
@@ -321,7 +369,7 @@ impl DirectXRenderer {
                     &viewport,
                 )],
             )?;
-            context.OMSetRenderTargets(Some(slice::from_ref(&scratch.blur_target)), None);
+            context.OMSetRenderTargets(Some(slice::from_ref(&blur.target)), None);
             context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -337,10 +385,7 @@ impl DirectXRenderer {
             context.VSSetConstantBuffers(2, Some(slice::from_ref(&backdrop_resources.params)));
             context.PSSetConstantBuffers(2, Some(slice::from_ref(&backdrop_resources.params)));
             context.PSSetSamplers(1, Some(slice::from_ref(&backdrop_resources.sampler)));
-            context.PSSetShaderResources(
-                3,
-                Some(&[scratch.copy_view.clone(), scratch.copy_view.clone()]),
-            );
+            context.PSSetShaderResources(3, Some(&[copy.view.clone(), copy.view.clone()]));
             context.Draw(4, 0);
 
             update_buffer(
@@ -352,10 +397,7 @@ impl DirectXRenderer {
             context.RSSetViewports(Some(slice::from_ref(&viewport)));
             context.VSSetShader(&backdrop_resources.vertical_vertex, None);
             context.PSSetShader(&backdrop_resources.vertical_fragment, None);
-            context.PSSetShaderResources(
-                3,
-                Some(&[scratch.blur_view.clone(), scratch.copy_view.clone()]),
-            );
+            context.PSSetShaderResources(3, Some(&[blur.view.clone(), copy.view.clone()]));
             context.Draw(4, 0);
             // The blur scratch is a render target again next time, and the copy a copy destination.
             context.PSSetShaderResources(3, Some(&[None, None]));

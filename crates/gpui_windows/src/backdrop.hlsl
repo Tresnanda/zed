@@ -54,9 +54,8 @@ float4 backdrop_horizontal_fragment(float4 position: SV_Position): SV_Target {
     float4 color = float4(0.0, 0.0, 0.0, 0.0);
     [loop]
     for (uint i = 0; i < info.y; i++) {
-        float2 at = p + float2(taps[i].x * k, 0.0);
-        // The copy ends at the crop; see backdrop.wgsl.
-        at.x = clamp(at.x, 0.5, crop.z - 0.5);
+        // The copy ends at the crop, odd sizes included; see backdrop.wgsl.
+        float2 at = clamp(p + float2(taps[i].x * k, 0.0), float2(0.5, 0.5), crop.zw - 0.5);
         color += backdrop_source.SampleLevel(backdrop_sampler, at / source_size, 0.0) * taps[i].y;
     }
     return color;
@@ -85,7 +84,8 @@ float4 backdrop_vertical_fragment(float4 position: SV_Position): SV_Target {
     backdrop_source.GetDimensions(width, height);
     float2 source_size = float2(width, height);
     float2 p = (pixel - crop.xy) / k;
-    float2 limit = crop.zw / k - 0.5;
+    // The horizontal pass wrote `ceil(crop / scale)` texels (`BackdropPlan::scratch_size`).
+    float2 limit = ceil(crop.zw / k) - 0.5;
     float4 c = float4(0.0, 0.0, 0.0, 0.0);
     [loop]
     for (uint i = 0; i < info.y; i++) {

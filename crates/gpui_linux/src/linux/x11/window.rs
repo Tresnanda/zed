@@ -1945,6 +1945,10 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().renderer.gpu_specs().into()
     }
 
+    fn backdrop_filter_supported(&self) -> bool {
+        self.0.state.borrow().renderer.backdrop_filter_supported()
+    }
+
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         let (device, queue) = self.0.state.borrow().renderer.gpu_context();
         Some(Box::new((device, queue)))

@@ -119,7 +119,7 @@ impl BackdropKernel {
 #[derive(Clone, Copy, Debug)]
 pub struct BackdropPlan {
     /// Device-pixel `[x, y, width, height]` of the target region the passes read: the clipped bounds plus a 3-sigma halo,
-    /// inside the target, width and height multiples of `scale`.
+    /// inside the target. Copied as is; at half resolution an odd width or height ends in a half block.
     pub crop: [u32; 4],
     /// 2 when the horizontal pass writes a half-size scratch (N2), else 1.
     pub scale: u32,
@@ -151,8 +151,6 @@ impl BackdropPlan {
             return None;
         }
         let sigma = blur.max(0.01);
-        let half = half_resolution && blur > 8.;
-        let scale = if half { 2u32 } else { 1 };
         let halo = (sigma * 3.).ceil();
         let left = (x - halo).floor().max(0.);
         let top = (y - halo).floor().max(0.);
@@ -161,22 +159,14 @@ impl BackdropPlan {
         if right <= left || bottom <= top {
             return None;
         }
+        // The crop is copied exactly, odd sizes included: rounding it to the half-resolution grid would either reach past
+        // the target or leave its last column or row uncopied, where the vertical pass reads the destination. Only the
+        // blur scratch rounds up (`scratch_size`); the passes clamp their reads to the copied size.
         let (left, top) = (left as u32, top as u32);
-        // Even crop at half resolution so every scratch texel covers a full 2x2 block. The region is copied, so unlike
-        // Metal's it cannot reach past the target: an odd last column or row moves the crop back by one pixel, or, on an
-        // odd-sized target narrower than the crop, is left out (the vertical pass clamps to the crop).
-        let even = |start: u32, end: u32, limit: u32| -> (u32, u32) {
-            let size = (end - start).max(1).div_ceil(scale) * scale;
-            if start + size <= limit {
-                (start, size)
-            } else if size <= limit {
-                (limit - size, size)
-            } else {
-                (0, (limit / scale * scale).max(scale.min(limit)))
-            }
-        };
-        let (left, crop_width) = even(left, right as u32, target_width);
-        let (top, crop_height) = even(top, bottom as u32, target_height);
+        let (crop_width, crop_height) = (right as u32 - left, bottom as u32 - top);
+        // A crop under 2 px has no 2x2 block to average.
+        let half = half_resolution && blur > 8. && crop_width >= 2 && crop_height >= 2;
+        let scale = if half { 2u32 } else { 1 };
         let (horizontal, vertical) = if half {
             (
                 BackdropKernel::half(blur / 2., true),
@@ -197,9 +187,12 @@ impl BackdropPlan {
             vertical,
         })
     }
-    /// The horizontal pass's output size, `crop / scale`.
+    /// The horizontal pass's output size, `crop / scale` rounded up: an odd last column or row gets its own texel.
     pub fn scratch_size(&self) -> (u32, u32) {
-        (self.crop[2] / self.scale, self.crop[3] / self.scale)
+        (
+            self.crop[2].div_ceil(self.scale),
+            self.crop[3].div_ceil(self.scale),
+        )
     }
 }
 
@@ -312,8 +305,27 @@ mod tests {
         assert_eq!(plan.scale, 2);
         assert_eq!(plan.crop, [52, 2, 296, 216]);
         assert_eq!(plan.scratch_size(), (148, 108));
+        // An odd target narrower than the halo: copied whole, the last column and row in a texel of their own.
         let plan = BackdropPlan::new([0., 0., 33., 33.], 16., 33, 33, true).unwrap();
-        assert_eq!(plan.crop, [0, 0, 32, 32]);
+        assert_eq!((plan.scale, plan.crop), (2, [0, 0, 33, 33]));
+        assert_eq!(plan.scratch_size(), (17, 17));
+        let plan = BackdropPlan::new([0., 0., 721., 481.], 16., 721, 481, true).unwrap();
+        assert_eq!(
+            (plan.crop, plan.scratch_size()),
+            ([0, 0, 721, 481], (361, 241))
+        );
+        // An odd crop inside the target is not moved or widened either.
+        let plan = BackdropPlan::new([100., 50., 201., 120.], 16., 1000, 800, true).unwrap();
+        assert_eq!(
+            (plan.crop, plan.scratch_size()),
+            ([52, 2, 297, 216], (149, 108))
+        );
+        // Under 2 px of crop there is no block to average: full resolution, never a 0 px scratch.
+        let plan = BackdropPlan::new([0., 0., 50., 1.], 16., 100, 1, true).unwrap();
+        assert_eq!(
+            (plan.scale, plan.crop, plan.scratch_size()),
+            (1, [0, 0, 98, 1], (98, 1))
+        );
         let plan = BackdropPlan::new([10.5, 10.5, 20., 20.], 4., 100, 100, true).unwrap();
         assert_eq!((plan.scale, plan.crop), (1, [0, 0, 43, 43]));
         assert!(BackdropPlan::new([0., 0., 0., 10.], 16., 100, 100, true).is_none());

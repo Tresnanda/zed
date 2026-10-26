@@ -1023,6 +1023,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    /// Kybern: whether this window's renderer draws the scene backdrop filter (`Scene::backdrops`). Where it does not,
+    /// a filter draws nothing and only the fill painted above it shows.
+    fn backdrop_filter_supported(&self) -> bool {
+        false
+    }
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.

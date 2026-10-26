@@ -62,10 +62,10 @@ fn fs_backdrop_horizontal(input: Varying) -> @location(0) vec4<f32> {
     var color = vec4<f32>(0.0);
     for (var i = 0u; i < params.info.y; i++) {
         let tap = params.taps[i];
-        var at = position + vec2<f32>(tap.x * k, 0.0);
         // Metal samples the whole target here; the copy ends at the crop, which equals it for every texel the vertical
-        // pass reads inside the clip (the crop holds the 3-sigma halo), and at a target edge equals clamp-to-edge.
-        at.x = clamp(at.x, 0.5, params.crop.z - 0.5);
+        // pass reads inside the clip (the crop holds the 3-sigma halo), and at a target edge equals clamp-to-edge. The
+        // pooled copy texture is larger than the crop: an odd crop's last half block reads its one copied column or row.
+        let at = clamp(position + vec2<f32>(tap.x * k, 0.0), vec2<f32>(0.5), params.crop.zw - vec2<f32>(0.5));
         color += textureSampleLevel(source, linear_clamp, at / source_size, 0.0) * tap.y;
     }
     return color;
@@ -99,7 +99,8 @@ fn fs_backdrop_vertical(input: Varying) -> @location(0) vec4<f32> {
     let k = params.values.w;
     let source_size = vec2<f32>(textureDimensions(source));
     let position = (pixel - params.crop.xy) / k;
-    let limit = params.crop.zw / k - vec2<f32>(0.5);
+    // The horizontal pass wrote `ceil(crop / scale)` texels (`BackdropPlan::scratch_size`).
+    let limit = ceil(params.crop.zw / k) - vec2<f32>(0.5);
     var c = vec4<f32>(0.0);
     for (var i = 0u; i < params.info.y; i++) {
         let tap = params.taps[i];
