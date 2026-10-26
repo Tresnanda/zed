@@ -757,6 +757,9 @@ pub enum WindowControlArea {
     Max,
     /// An area that allows minimizing of the platform window.
     Min,
+    /// The client area inside one of the areas above: a control painted over a
+    /// drag area keeps its own press instead of moving the window (Windows).
+    Client,
 }
 
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
@@ -1829,9 +1832,12 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
+                        // The topmost area under the pointer wins, so a control (`Client`)
+                        // inside a drag area is not part of the caption.
+                        let areas = &window.rendered_frame.window_control_hitboxes;
+                        for id in &window.mouse_hit_test.ids {
+                            if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
+                                return (*area != WindowControlArea::Client).then_some(*area);
                             }
                         }
                         None
