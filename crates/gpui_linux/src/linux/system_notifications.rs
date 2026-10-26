@@ -4,6 +4,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -15,6 +18,16 @@ use gpui::{
 /// rather than a specific action button.
 const DEFAULT_ACTION: &str = "default";
 
+/// The server-side notification a tag last produced. A tag that is posted
+/// again replaces that notification (`replaces_id`), so the thread that waits
+/// on the older post must stop reporting: both would hear the same id.
+struct Slot {
+    server_id: u32,
+    generation: u64,
+}
+
+type Slots = Arc<Mutex<HashMap<SharedString, Slot>>>;
+
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
 
 pub(crate) struct SystemNotificationState {
@@ -22,6 +35,8 @@ pub(crate) struct SystemNotificationState {
     response_receiver: Option<mpsc::UnboundedReceiver<SystemNotificationResponse>>,
     callback: ResponseCallback,
     _response_task: Option<Task<()>>,
+    slots: Slots,
+    generation: Arc<AtomicU64>,
 }
 
 impl SystemNotificationState {
@@ -32,17 +47,36 @@ impl SystemNotificationState {
             response_receiver: Some(response_receiver),
             callback: Rc::new(RefCell::new(None)),
             _response_task: None,
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub(crate) fn show(&self, app_name: Option<&str>, notification: SystemNotification) {
+    /// `identity` is the `(identifier, name)` given to `set_app_identity`. The
+    /// identifier doubles as the desktop entry and the icon name, which is how
+    /// an installed app (`<identifier>.desktop`, an icon of the same name)
+    /// shows its own icon and groups its notifications.
+    pub(crate) fn show(&self, identity: Option<(&str, &str)>, notification: SystemNotification) {
         let mut builder = notify_rust::Notification::new();
-        if let Some(app_name) = app_name {
-            builder.appname(app_name);
+        if let Some((identifier, name)) = identity {
+            builder
+                .appname(name)
+                .icon(identifier)
+                .hint(notify_rust::Hint::DesktopEntry(identifier.to_string()));
+        }
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let replaces = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(&notification.tag).map(|slot| slot.server_id));
+        if let Some(server_id) = replaces {
+            builder.id(server_id);
         }
         builder
             .summary(&notification.title)
             .body(&notification.body)
+            .sound_name("message-new-instant")
             .action(DEFAULT_ACTION, DEFAULT_ACTION);
         let mut action_ids = HashMap::new();
         for (index, action) in notification.actions.iter().enumerate() {
@@ -53,33 +87,49 @@ impl SystemNotificationState {
         let built = builder.finalize();
 
         let sender = self.response_sender.clone();
+        let slots = self.slots.clone();
         let tag = notification.tag.clone();
         // `show` connects to the session bus and `wait_for_action` blocks
         // until the notification closes, so both run off the UI thread.
         let spawn_result = std::thread::Builder::new()
             .name("system-notification".to_string())
             .spawn(move || match built.show() {
-                Ok(handle) => handle.wait_for_action(|action| {
-                    let action_id = match action {
-                        // Sent by `notify-rust` when the notification closes
-                        // without being activated.
-                        "__closed" => return,
-                        transport_id => {
-                            let Some(action_id) = response_action_id(transport_id, &action_ids)
-                            else {
-                                log::warn!(
-                                    "system notification returned unknown action {transport_id:?}"
-                                );
+                Ok(handle) => {
+                    if !claim_slot(&slots, &tag, handle.id(), generation) {
+                        return;
+                    }
+                    handle.wait_for_action(|action| {
+                        let action_id = match action {
+                            // Sent by `notify-rust` when the notification closes
+                            // without being activated.
+                            "__closed" => {
+                                release_slot(&slots, &tag, generation);
                                 return;
-                            };
-                            action_id
+                            }
+                            transport_id => {
+                                let Some(action_id) = response_action_id(transport_id, &action_ids)
+                                else {
+                                    log::warn!(
+                                        "system notification returned unknown action {transport_id:?}"
+                                    );
+                                    return;
+                                };
+                                action_id
+                            }
+                        };
+                        // A newer post under this tag replaced this one on the
+                        // server; its own thread reports the response.
+                        if !is_current_slot(&slots, &tag, generation) {
+                            return;
                         }
-                    };
-                    sender
-                        .unbounded_send(SystemNotificationResponse { tag, action_id })
-                        .ok();
-                }),
-                Err(error) => log::warn!("failed to show system notification: {error}"),
+                        sender
+                            .unbounded_send(SystemNotificationResponse { tag, action_id })
+                            .ok();
+                    })
+                }
+                // No notification daemon (a headless session, a minimal window
+                // manager) is an ordinary setup, not a fault.
+                Err(error) => log::debug!("failed to show system notification: {error}"),
             });
         if let Err(error) = spawn_result {
             log::warn!("failed to spawn system notification thread: {error}");
@@ -118,6 +168,49 @@ impl SystemNotificationState {
     }
 }
 
+/// Records the server id `generation` of `tag` got. False when a newer post for
+/// the tag finished first, which already holds the slot.
+fn claim_slot(slots: &Slots, tag: &SharedString, server_id: u32, generation: u64) -> bool {
+    let Ok(mut slots) = slots.lock() else {
+        return false;
+    };
+    if slots
+        .get(tag)
+        .is_some_and(|slot| slot.generation > generation)
+    {
+        return false;
+    }
+    slots.insert(
+        tag.clone(),
+        Slot {
+            server_id,
+            generation,
+        },
+    );
+    true
+}
+
+fn is_current_slot(slots: &Slots, tag: &SharedString, generation: u64) -> bool {
+    slots.lock().is_ok_and(|slots| {
+        slots
+            .get(tag)
+            .is_some_and(|slot| slot.generation == generation)
+    })
+}
+
+/// Forgets the server id when its own notification closed, so the next post
+/// under the tag is a new notification rather than a replacement of a gone one.
+fn release_slot(slots: &Slots, tag: &SharedString, generation: u64) {
+    if let Ok(mut slots) = slots.lock() {
+        if slots
+            .get(tag)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            slots.remove(tag);
+        }
+    }
+}
+
 fn response_action_id(
     transport_id: &str,
     action_ids: &HashMap<String, SharedString>,
@@ -132,6 +225,24 @@ fn response_action_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_post_under_the_tag_owns_the_slot() {
+        let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
+        let tag = SharedString::from("thread-1");
+        assert!(claim_slot(&slots, &tag, 7, 1));
+        assert!(is_current_slot(&slots, &tag, 1));
+        // The replacement keeps the server id and takes over.
+        assert!(claim_slot(&slots, &tag, 7, 2));
+        assert!(!is_current_slot(&slots, &tag, 1));
+        assert!(is_current_slot(&slots, &tag, 2));
+        // The older post's thread finishing late neither claims nor releases it.
+        assert!(!claim_slot(&slots, &tag, 7, 1));
+        release_slot(&slots, &tag, 1);
+        assert!(is_current_slot(&slots, &tag, 2));
+        release_slot(&slots, &tag, 2);
+        assert!(slots.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn caller_action_ids_do_not_collide_with_transport_action_ids() {

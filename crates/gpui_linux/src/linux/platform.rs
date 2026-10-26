@@ -125,7 +125,7 @@ pub(crate) struct LinuxCommon {
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
     pub(crate) menus: Vec<OwnedMenu>,
-    app_name: Option<String>,
+    app_identity: Option<(String, String)>,
     system_notifications: crate::linux::system_notifications::SystemNotificationState,
     #[cfg_attr(
         not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
@@ -167,7 +167,7 @@ impl LinuxCommon {
             callbacks,
             signal,
             menus: Vec::new(),
-            app_name: None,
+            app_identity: None,
             system_notifications: crate::linux::system_notifications::SystemNotificationState::new(
             ),
             wake_sender,
@@ -566,16 +566,19 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         });
     }
 
-    fn set_app_identity(&self, _identifier: &str, name: &str) {
-        self.inner
-            .with_common(|common| common.app_name = Some(name.to_string()));
+    fn set_app_identity(&self, identifier: &str, name: &str) {
+        self.inner.with_common(|common| {
+            common.app_identity = Some((identifier.to_string(), name.to_string()))
+        });
     }
 
     fn show_system_notification(&self, notification: gpui::SystemNotification) {
         self.inner.with_common(|common| {
-            common
-                .system_notifications
-                .show(common.app_name.as_deref(), notification)
+            let identity = common
+                .app_identity
+                .as_ref()
+                .map(|(identifier, name)| (identifier.as_str(), name.as_str()));
+            common.system_notifications.show(identity, notification)
         });
     }
 

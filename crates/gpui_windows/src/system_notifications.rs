@@ -181,9 +181,8 @@ fn toast_document(notification: &SystemNotification) -> windows::core::Result<Xm
         }
     }
 
-    let audio = document.CreateElement(h!("audio"))?;
-    audio.SetAttribute(h!("silent"), h!("true"))?;
-    toast.AppendChild(&audio)?;
+    // No <audio> element: Windows plays its default notification sound, like
+    // the macOS notification Kybern posts, and Focus Assist silences it.
     Ok(document)
 }
 
