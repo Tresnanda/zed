@@ -757,6 +757,9 @@ pub enum WindowControlArea {
     Max,
     /// An area that allows minimizing of the platform window.
     Min,
+    /// The client area inside one of the areas above: a control painted over a
+    /// drag area keeps its own press instead of moving the window (Windows).
+    Client,
 }
 
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
@@ -1020,6 +1023,7 @@ pub(crate) struct PaintIndex {
     root_key_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1826,18 +1830,32 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
+            // The last answer, for a hit test that arrives while the app is borrowed (a message
+            // pumped during an update): the pointer has not moved since, or Windows would have
+            // asked again outside it.
+            let last = Rc::new(Cell::new(None));
             Box::new(move || {
-                handle
-                    .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
+                let answer = handle.update(&mut cx, |_, window, _cx| {
+                    // A fresh hit test where the pointer is now: `mouse_hit_test` is only as new as
+                    // the last mouse event GPUI dispatched, and Windows asks before it sends the
+                    // move or press that would update it. The topmost area wins, so a control
+                    // (`Client`) inside a drag area is not part of the caption.
+                    let hit = window.rendered_frame.hit_test(window.platform_window.mouse_position());
+                    let areas = &window.rendered_frame.window_control_hitboxes;
+                    for id in &hit.ids {
+                        if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
+                            return (*area != WindowControlArea::Client).then_some(*area);
                         }
-                        None
-                    })
-                    .log_err()
-                    .unwrap_or(None)
+                    }
+                    None
+                });
+                match answer {
+                    Ok(area) => {
+                        last.set(area);
+                        area
+                    }
+                    Err(_) => last.get(),
+                }
             })
         });
         platform_window.on_move_tab_to_new_window({
@@ -3720,6 +3738,7 @@ impl Window {
             root_key_listeners_index: self.next_frame.root_key_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -3730,6 +3749,14 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        // A cached view keeps its window-control areas (a custom title bar inside one), or the
+        // Windows hit test loses the caption and its buttons on every frame that reuses it.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes
+                [range.start.window_control_hitboxes_index..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
