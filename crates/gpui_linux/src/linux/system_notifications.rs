@@ -122,6 +122,10 @@ impl SystemNotificationState {
                         if !is_current_slot(&slots, &tag, generation) {
                             return;
                         }
+                        // A server closes a notification once it was activated,
+                        // and this thread stops listening with the response, so
+                        // the next post under the tag is a new notification.
+                        release_slot(&slots, &tag, generation);
                         sender
                             .unbounded_send(SystemNotificationResponse { tag, action_id })
                             .ok();
