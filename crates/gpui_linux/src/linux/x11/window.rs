@@ -1744,6 +1744,13 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let (width, height, pixels) = self.0.state.borrow_mut().renderer.render_to_rgba(scene)?;
+        image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow::anyhow!("the readback does not fill {width}x{height}"))
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()
