@@ -217,6 +217,16 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
     );
 }
 
+fn load_surface(instance_id: u32) -> SurfaceInstance {
+    var cursor = instance_cursor(instance_id * 12u);
+    return SurfaceInstance(
+        read_bounds(&cursor),
+        read_content_mask(&cursor),
+        read_f32(&cursor),
+        read_word(&cursor),
+    );
+}
+
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     var cursor = instance_cursor(instance_id * 26u);
     return PolychromeSprite(
