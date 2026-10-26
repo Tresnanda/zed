@@ -1023,6 +1023,7 @@ pub(crate) struct PaintIndex {
     root_key_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -3737,6 +3738,7 @@ impl Window {
             root_key_listeners_index: self.next_frame.root_key_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -3747,6 +3749,14 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        // A cached view keeps its window-control areas (a custom title bar inside one), or the
+        // Windows hit test loses the caption and its buttons on every frame that reuses it.
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes
+                [range.start.window_control_hitboxes_index..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
