@@ -874,8 +874,23 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
 
-        // using Dwm APIs for Mica and MicaAlt backdrops.
-        // others follow the set_window_composition_attribute approach
+        // Kybern: Windows 11 22H2+ system backdrops through DWM (DWMSBT_*), drawn behind the composition swap chain's
+        // transparent pixels once the frame extends over the client area. Blurred is Acrylic there (the accent blur
+        // lags while the window moves); older builds keep SetWindowCompositionAttribute. Each mode clears the other
+        // mechanism, so switching between them leaves no stale backdrop.
+        let system_backdrops = system_backdrops_supported();
+        let system_backdrop = match background_appearance {
+            WindowBackgroundAppearance::Blurred if system_backdrops => Some(3), // DWMSBT_TRANSIENTWINDOW: Acrylic
+            WindowBackgroundAppearance::MicaBackdrop => Some(2), // DWMSBT_MAINWINDOW: Mica
+            WindowBackgroundAppearance::MicaAltBackdrop => Some(4), // DWMSBT_TABBEDWINDOW: Mica Alt
+            _ => None,
+        };
+        if system_backdrops {
+            dwm_set_window_composition_attribute(hwnd, system_backdrop.unwrap_or(1)); // DWMSBT_NONE
+            let extent = if system_backdrop.is_some() { -1 } else { 0 };
+            let margins = MARGINS { cxLeftWidth: extent, cxRightWidth: extent, cyTopHeight: extent, cyBottomHeight: extent };
+            unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }.log_err();
+        }
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
@@ -883,16 +898,13 @@ impl PlatformWindow for WindowsWindow {
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
             }
-            WindowBackgroundAppearance::Blurred => {
+            WindowBackgroundAppearance::Blurred if !system_backdrops => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
             }
-            WindowBackgroundAppearance::MicaBackdrop => {
-                // DWMSBT_MAINWINDOW => MicaBase
-                dwm_set_window_composition_attribute(hwnd, 2);
-            }
-            WindowBackgroundAppearance::MicaAltBackdrop => {
-                // DWMSBT_TABBEDWINDOW => MicaAlt
-                dwm_set_window_composition_attribute(hwnd, 4);
+            WindowBackgroundAppearance::Blurred
+            | WindowBackgroundAppearance::MicaBackdrop
+            | WindowBackgroundAppearance::MicaAltBackdrop => {
+                set_window_composition_attribute(hwnd, None, 0);
             }
         }
     }
@@ -1546,13 +1558,20 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
-fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
-    let mut version = unsafe { std::mem::zeroed() };
-    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+/// DWMWA_SYSTEMBACKDROP_TYPE exists from Windows 11 22H2 (build 22621).
+pub(crate) fn system_backdrops_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut version = unsafe { std::mem::zeroed() };
+        let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+        status.is_ok() && version.dwBuildNumber >= 22621
+    })
+}
 
+fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
     // using SetWindowCompositionAttributeType as a fallback
-    if !status.is_ok() || version.dwBuildNumber < 22621 {
+    if !system_backdrops_supported() {
         return;
     }
 

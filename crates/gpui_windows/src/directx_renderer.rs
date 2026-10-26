@@ -56,6 +56,8 @@ pub(crate) struct DirectXRenderer {
     skip_draws: bool,
     /// Kybern: the scene's rounded clip chains (buffer, view, capacity in nodes).
     rounded_clips: Option<(ID3D11Buffer, Option<ID3D11ShaderResourceView>, usize)>,
+    /// Kybern: the scene backdrop filter (`directx_backdrop.rs`), created with the first filter.
+    backdrop: Option<DirectXBackdrop>,
 }
 
 /// Direct3D objects
@@ -197,6 +199,7 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
             rounded_clips: None,
+            backdrop: None,
         })
     }
 
@@ -327,6 +330,7 @@ impl DirectXRenderer {
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.rounded_clips = None;
+        self.backdrop = None;
         self.skip_draws = true;
         Ok(())
     }
@@ -361,6 +365,9 @@ impl DirectXRenderer {
         })?;
         self.upload_scene_buffers(scene)?;
         self.upload_rounded_clips(&scene.rounded_clips)?;
+        if let Some(backdrop) = &mut self.backdrop {
+            backdrop.begin_frame(!scene.backdrops.is_empty());
+        }
 
         let annotation = self
             .devices
@@ -372,8 +379,8 @@ impl DirectXRenderer {
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
             match batch {
-                // Kybern: no backdrop filter here; the translucent fill above it still paints.
-                PrimitiveBatch::Backdrop(_) => Ok(()),
+                // Kybern: filter the back buffer region behind it; KYBERN_BACKDROP_FILTER=0 leaves the translucent fill above it alone.
+                PrimitiveBatch::Backdrop(index) => self.draw_backdrop(&scene.backdrops[index]),
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
@@ -1751,6 +1758,8 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        BackdropHorizontal,
+        BackdropVertical,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1828,6 +1837,14 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
                 },
+                ShaderModule::BackdropHorizontal => match target {
+                    ShaderTarget::Vertex => BACKDROP_HORIZONTAL_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_HORIZONTAL_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropVertical => match target {
+                    ShaderTarget::Vertex => BACKDROP_VERTICAL_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_VERTICAL_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -1840,10 +1857,10 @@ pub(crate) mod shader_resources {
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
-            } else {
-                "shaders.hlsl"
+            let shader_name = match entry {
+                ShaderModule::EmojiRasterization => "color_text_raster.hlsl",
+                ShaderModule::BackdropHorizontal | ShaderModule::BackdropVertical => "backdrop.hlsl",
+                _ => "shaders.hlsl",
             };
 
             let entry = format!(
@@ -1915,6 +1932,8 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::BackdropHorizontal => "backdrop_horizontal",
+                ShaderModule::BackdropVertical => "backdrop_vertical",
             }
         }
     }
@@ -2108,3 +2127,5 @@ fn rounded_clips_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var("KYBERN_ROUNDED_CLIP").is_ok_and(|value| value == "0"))
 }
+
+include!("directx_backdrop.rs");
