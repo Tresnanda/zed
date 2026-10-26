@@ -1334,6 +1334,13 @@ impl WgpuRenderer {
         self.dual_source_blending
     }
 
+    /// Kybern: whether `draw` runs the scene backdrop filter; the conditions `record_frame` checks per frame.
+    pub fn backdrop_filter_supported(&self) -> bool {
+        backdrop_filter_enabled()
+            && !self.uses_webgl_instance_data
+            && self.surface_config.usage.contains(wgpu::TextureUsages::COPY_SRC)
+    }
+
     pub fn gpu_specs(&self) -> GpuSpecs {
         GpuSpecs {
             is_software_emulated: self.adapter_info.device_type == wgpu::DeviceType::Cpu,
@@ -2691,6 +2698,52 @@ mod tests {
         // Painted after the filter: sharp.
         assert_eq!(at(99, 60), [255, 0, 0, 255]);
         assert!(at(96, 60)[0] < 200 && at(96, 60)[1] > 60, "neighbour of the sharp line {:?}", at(96, 60));
+    }
+
+    /// Kybern: an odd-sized target under a half-resolution filter covering all of it, at half coverage. The crop is the
+    /// whole target, so its last column and row must be copied too: the vertical pass mixes the destination there.
+    #[test]
+    fn backdrop_filter_copies_the_last_column_and_row_of_an_odd_target() {
+        use gpui::{Backdrop, Bounds, ContentMask, Hsla, Quad, point, size};
+        let Ok(context) = WgpuContext::new_offscreen() else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let (width, height) = (201, 121);
+        let target = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, target).expect("offscreen renderer");
+        let whole = Bounds { origin: point(ScaledPixels(0.), ScaledPixels(0.)), size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)) };
+        let mask = ContentMask { bounds: whole, rounded_clip: 0, clip_generation: 0 };
+        let quad = |x: f32, y: f32, w: f32, h: f32, color: Hsla| Quad {
+            bounds: Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(w), ScaledPixels(h)) },
+            content_mask: mask.clone(),
+            background: color.into(),
+            ..Default::default()
+        };
+        let green: Hsla = gpui::rgb(0x00a000).into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., width as f32, height as f32, green));
+        // Stripes far (> 3 sigma) from the last column and row, so the filter visibly ran.
+        for stripe in (0..96).step_by(8) {
+            scene.insert_primitive(quad(stripe as f32, 0., 4., 60., gpui::white()));
+        }
+        scene.insert_primitive(Backdrop { order: 0, bounds: whole, content_mask: mask.clone(), blur: ScaledPixels(16.), radius: ScaledPixels(0.), saturation: 1., opacity: 0.5, fade_top: 0. });
+        scene.finish();
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        renderer.render_to_pixels(&scene, target, &mut pixels).expect("render");
+        let at = |x: i32, y: i32| {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let near = |pixel: [u8; 4]| pixel[0] < 4 && (pixel[1] as i32 - 0xa0).abs() < 4 && pixel[2] < 4;
+        for y in 0..height {
+            assert!(near(at(width - 1, y)), "last column y={y}: {:?}", at(width - 1, y));
+        }
+        for x in 110..width {
+            assert!(near(at(x, height - 1)), "last row x={x}: {:?}", at(x, height - 1));
+        }
+        let stripe = at(1, 30);
+        assert!(stripe[0] > 20 && stripe[0] < 235, "the stripes are not blurred: {stripe:?}");
     }
 
     fn validate_wgsl(source: &str, capabilities: naga::valid::Capabilities) {

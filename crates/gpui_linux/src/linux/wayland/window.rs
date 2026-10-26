@@ -2113,6 +2113,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().renderer.gpu_specs().into()
     }
 
+    fn backdrop_filter_supported(&self) -> bool {
+        self.borrow().renderer.backdrop_filter_supported()
+    }
+
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         let (device, queue) = self.borrow().renderer.gpu_context();
         Some(Box::new((device, queue)))

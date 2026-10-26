@@ -49,6 +49,9 @@ fragment float4 backdrop_fragment(Varying in [[stage_in]], float4 dst [[color(0)
         if(distance>=0.5)discard_fragment();
         float luminance=dot(c.rgb,float3(0.2126,0.7152,0.0722));
         c.rgb=mix(float3(luminance),c.rgb,p.values.y);
+        // Saturation above 1 pushes premultiplied channels outside 0…alpha, which a coverage below 1 or a translucent
+        // destination would carry into the result.
+        c.rgb=clamp(c.rgb,0.0,blurred_alpha);
         // Blend fractional rounded edge against the unfiltered destination.
         c.a=clamp(0.5-distance,0.0,1.0)*p.viewport.z;
         uint id=p.rounded_clip;
@@ -103,6 +106,9 @@ fragment float4 backdrop_kernel_fragment(Varying in [[stage_in]], float4 dst [[c
         if(distance>=0.5)discard_fragment();
         float luminance=dot(c.rgb,float3(0.2126,0.7152,0.0722));
         c.rgb=mix(float3(luminance),c.rgb,p.values.y);
+        // Saturation above 1 pushes premultiplied channels outside 0…alpha, which a coverage below 1 or a translucent
+        // destination would carry into the result.
+        c.rgb=clamp(c.rgb,0.0,blurred_alpha);
         // Blend fractional rounded edge against the unfiltered destination.
         c.a=clamp(0.5-distance,0.0,1.0)*p.viewport.z;
         uint id=p.rounded_clip;

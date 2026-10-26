@@ -259,10 +259,10 @@ pub trait Platform: 'static {
     /// of the OS-wide setting. Pass `None` to clear the override and follow the system
     /// again. The override is reflected by [`Platform::window_appearance`].
     ///
-    /// Currently only implemented on macOS, where it sets `NSApplication.appearance` so
+    /// Implemented on macOS, where it sets `NSApplication.appearance` so
     /// the native window chrome (the window border and titlebar) of every window matches
-    /// a dark app theme even when the system is in light mode (or vice versa). A no-op on
-    /// other platforms.
+    /// a dark app theme even when the system is in light mode (or vice versa), and (Kybern)
+    /// on Windows, where it sets DWM dark mode. A no-op on other platforms.
     fn set_window_appearance(&self, _appearance: Option<WindowAppearance>) {}
 
     /// Returns the window button layout configuration when supported.
@@ -1027,6 +1027,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    /// Kybern: whether this window's renderer draws the scene backdrop filter (`Scene::backdrops`). Where it does not,
+    /// a filter draws nothing and only the fill painted above it shows.
+    fn backdrop_filter_supported(&self) -> bool {
+        false
+    }
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.

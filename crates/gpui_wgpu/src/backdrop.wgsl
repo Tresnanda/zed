@@ -62,10 +62,10 @@ fn fs_backdrop_horizontal(input: Varying) -> @location(0) vec4<f32> {
     var color = vec4<f32>(0.0);
     for (var i = 0u; i < params.info.y; i++) {
         let tap = params.taps[i];
-        var at = position + vec2<f32>(tap.x * k, 0.0);
         // Metal samples the whole target here; the copy ends at the crop, which equals it for every texel the vertical
-        // pass reads inside the clip (the crop holds the 3-sigma halo), and at a target edge equals clamp-to-edge.
-        at.x = clamp(at.x, 0.5, params.crop.z - 0.5);
+        // pass reads inside the clip (the crop holds the 3-sigma halo), and at a target edge equals clamp-to-edge. The
+        // pooled copy texture is larger than the crop: an odd crop's last half block reads its one copied column or row.
+        let at = clamp(position + vec2<f32>(tap.x * k, 0.0), vec2<f32>(0.5), params.crop.zw - vec2<f32>(0.5));
         color += textureSampleLevel(source, linear_clamp, at / source_size, 0.0) * tap.y;
     }
     return color;
@@ -99,7 +99,8 @@ fn fs_backdrop_vertical(input: Varying) -> @location(0) vec4<f32> {
     let k = params.values.w;
     let source_size = vec2<f32>(textureDimensions(source));
     let position = (pixel - params.crop.xy) / k;
-    let limit = params.crop.zw / k - vec2<f32>(0.5);
+    // The horizontal pass wrote `ceil(crop / scale)` texels (`BackdropPlan::scratch_size`).
+    let limit = ceil(params.crop.zw / k) - vec2<f32>(0.5);
     var c = vec4<f32>(0.0);
     for (var i = 0u; i < params.info.y; i++) {
         let tap = params.taps[i];
@@ -115,7 +116,8 @@ fn fs_backdrop_vertical(input: Varying) -> @location(0) vec4<f32> {
         discard;
     }
     let luminance = dot(c.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let rgb = mix(vec3<f32>(luminance), c.rgb, params.values.y);
+    // Saturation above 1 pushes premultiplied channels outside 0..alpha (backdrop.metal).
+    let rgb = clamp(mix(vec3<f32>(luminance), c.rgb, params.values.y), vec3<f32>(0.0), vec3<f32>(blurred_alpha));
     var coverage = clamp(0.5 - distance, 0.0, 1.0) * params.viewport.z;
     var id = params.info.x;
     for (var link = 0u; link < 64u && id != 0u; link++) {

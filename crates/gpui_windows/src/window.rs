@@ -550,7 +550,7 @@ impl WindowsWindow {
 
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
-        configure_dwm_dark_mode(hwnd, appearance);
+        configure_dwm_dark_mode(hwnd, dwm_appearance(appearance));
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -1023,6 +1023,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    fn backdrop_filter_supported(&self) -> bool {
+        backdrop_filter_enabled()
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

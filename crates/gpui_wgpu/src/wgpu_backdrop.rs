@@ -4,7 +4,7 @@
 //! second scratch (half size for wide blurs, `KYBERN_BACKDROP_HALFRES=0` keeps full size), then draw the vertical pass
 //! into the target. Metal samples the target directly; a swap chain image cannot be bound as a texture here, so the copy
 //! is the price, and it is cropped to the filter, never the whole frame. Every filter of a frame shares one uniform
-//! buffer (dynamic offsets) and the two scratch textures, which are pooled like Metal's (N1).
+//! buffer (dynamic offsets) and the two scratch textures, each pooled like Metal's (N1).
 
 use gpui::backdrop_kernel::{BackdropKernel, BackdropPlan};
 use std::num::NonZeroU64;
@@ -40,47 +40,97 @@ struct Scratch {
     view: wgpu::TextureView,
 }
 
-/// The scratch pool: sizes round up to 64 px buckets, 30 frames without a filter release both textures, and they are
-/// re-created smaller when the largest request of the last 120 frames is under half their area.
-struct Pool {
-    frame: u64,
-    last_draw: u64,
+fn bucket(value: u32) -> u32 {
+    value.max(1).div_ceil(SCRATCH_BUCKET) * SCRATCH_BUCKET
+}
+
+/// One pooled scratch texture: sizes round up to 64 px buckets, it is re-created to grow, or smaller when the largest
+/// request of the last 120 frames is under half its area. The copy and the blur scratch are pooled apart, since at half
+/// resolution the blur scratch needs a quarter of the copy's texels.
+struct Pooled {
+    scratch: Option<Scratch>,
+    size: (u32, u32),
     created: u64,
     requests: [(u32, u32); SCRATCH_SHRINK_FRAMES],
 }
 
-impl Default for Pool {
+impl Default for Pooled {
     fn default() -> Self {
         Self {
-            frame: 0,
-            last_draw: 0,
+            scratch: None,
+            size: (0, 0),
             created: 0,
             requests: [(0, 0); SCRATCH_SHRINK_FRAMES],
         }
     }
 }
 
-fn bucket(value: u32) -> u32 {
-    value.max(1).div_ceil(SCRATCH_BUCKET) * SCRATCH_BUCKET
+impl Pooled {
+    /// Record this frame's largest request and return the size to re-create the texture at, if it must change.
+    fn resize(
+        &mut self,
+        frame: u64,
+        slot: usize,
+        (want_width, want_height): (u32, u32),
+    ) -> Option<(u32, u32)> {
+        let request = &mut self.requests[slot];
+        *request = (request.0.max(want_width), request.1.max(want_height));
+        let (width, height) = self.size;
+        if self.scratch.is_none() {
+            Some((bucket(want_width), bucket(want_height)))
+        } else if width < want_width || height < want_height {
+            Some((
+                bucket(want_width).max(width),
+                bucket(want_height).max(height),
+            ))
+        } else if frame.saturating_sub(self.created) >= SCRATCH_SHRINK_FRAMES as u64 {
+            let (most_width, most_height) = self
+                .requests
+                .iter()
+                .fold((0, 0), |(a, b), &(x, y)| (a.max(x), b.max(y)));
+            let largest = self
+                .requests
+                .iter()
+                .map(|&(x, y)| u64::from(x) * u64::from(y))
+                .max()
+                .unwrap_or(0);
+            let area = u64::from(width) * u64::from(height);
+            let (most_width, most_height) = (bucket(most_width), bucket(most_height));
+            (largest * 2 < area && u64::from(most_width) * u64::from(most_height) < area)
+                .then_some((most_width, most_height))
+        } else {
+            None
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        if self.scratch.is_none() {
+            return 0;
+        }
+        4 * u64::from(self.size.0) * u64::from(self.size.1)
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct WgpuBackdrop {
     pipelines: Option<Pipelines>,
-    /// The copied target region (full resolution).
-    copy: Option<Scratch>,
-    /// The horizontal pass's output (`crop / scale`).
-    blur: Option<Scratch>,
-    /// Size of both scratches: the copy is this size, the blur scratch is never larger.
-    scratch_size: (u32, u32),
+    /// The copied target region (full resolution, the largest crop).
+    copy: Pooled,
+    /// The horizontal pass's output (the largest `BackdropPlan::scratch_size`).
+    blur: Pooled,
+    frame: u64,
+    last_draw: u64,
     uniforms: Option<wgpu::Buffer>,
     uniform_stride: u64,
+    /// This frame's parameters, kept to reuse the allocation.
+    uniform_data: Vec<u8>,
     params_bind_group: Option<wgpu::BindGroup>,
+    /// What `params_bind_group` binds: the uniform buffer, the chain buffer and its size in use.
+    params_bound: Option<(wgpu::Buffer, wgpu::Buffer, u64)>,
     horizontal_textures: Option<wgpu::BindGroup>,
     vertical_textures: Option<wgpu::BindGroup>,
     /// This frame's plan per `Scene::backdrops` index; `None` draws nothing for that filter.
     plans: Vec<Option<BackdropPlan>>,
-    pool: Pool,
 }
 
 impl WgpuBackdrop {
@@ -214,9 +264,10 @@ impl WgpuBackdrop {
         rounded_clips: &wgpu::Buffer,
         rounded_clips_size: u64,
     ) {
-        self.pool.frame += 1;
-        let slot = (self.pool.frame % SCRATCH_SHRINK_FRAMES as u64) as usize;
-        self.pool.requests[slot] = (0, 0);
+        self.frame += 1;
+        let slot = (self.frame % SCRATCH_SHRINK_FRAMES as u64) as usize;
+        self.copy.requests[slot] = (0, 0);
+        self.blur.requests[slot] = (0, 0);
         self.plans.clear();
         let half = half_resolution();
         for backdrop in backdrops {
@@ -240,80 +291,71 @@ impl WgpuBackdrop {
             self.plans.push(plan);
         }
         if self.plans.iter().all(Option::is_none) {
-            if self.pool.frame.saturating_sub(self.pool.last_draw) > SCRATCH_RELEASE_FRAMES {
-                self.copy = None;
-                self.blur = None;
+            if self.frame.saturating_sub(self.last_draw) > SCRATCH_RELEASE_FRAMES {
+                self.copy.scratch = None;
+                self.blur.scratch = None;
                 self.horizontal_textures = None;
                 self.vertical_textures = None;
-                self.scratch_size = (0, 0);
+                self.params_bind_group = None;
+                self.params_bound = None;
             }
             return;
         }
-        self.pool.last_draw = self.pool.frame;
-        let (want_width, want_height) = self
-            .plans
-            .iter()
-            .flatten()
-            .fold((0, 0), |(width, height), plan| {
-                (width.max(plan.crop[2]), height.max(plan.crop[3]))
-            });
-        let request = &mut self.pool.requests[slot];
-        *request = (request.0.max(want_width), request.1.max(want_height));
+        self.last_draw = self.frame;
+        let (copy_want, blur_want) = self.plans.iter().flatten().fold(
+            ((0, 0), (0, 0)),
+            |((copy_width, copy_height), (blur_width, blur_height)), plan| {
+                let (width, height) = plan.scratch_size();
+                (
+                    (copy_width.max(plan.crop[2]), copy_height.max(plan.crop[3])),
+                    (blur_width.max(width), blur_height.max(height)),
+                )
+            },
+        );
 
         let pipelines = self
             .pipelines
             .get_or_insert_with(|| Self::pipelines(device, format));
-
-        let (width, height) = self.scratch_size;
-        let replace = if self.copy.is_none() {
-            Some((bucket(want_width), bucket(want_height)))
-        } else if width < want_width || height < want_height {
-            Some((
-                bucket(want_width).max(width),
-                bucket(want_height).max(height),
-            ))
-        } else if self.pool.frame.saturating_sub(self.pool.created) >= SCRATCH_SHRINK_FRAMES as u64
-        {
-            let (most_width, most_height) = self
-                .pool
-                .requests
-                .iter()
-                .fold((0, 0), |(a, b), &(x, y)| (a.max(x), b.max(y)));
-            let largest = self
-                .pool
-                .requests
-                .iter()
-                .map(|&(x, y)| u64::from(x) * u64::from(y))
-                .max()
-                .unwrap_or(0);
-            let area = u64::from(width) * u64::from(height);
-            let (most_width, most_height) = (bucket(most_width), bucket(most_height));
-            (largest * 2 < area && u64::from(most_width) * u64::from(most_height) < area)
-                .then_some((most_width, most_height))
-        } else {
-            None
+        let scratch = |label, (width, height), usage| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | usage,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            Scratch { texture, view }
         };
-        if let Some((width, height)) = replace {
-            let scratch = |label, usage| {
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | usage,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                Scratch { texture, view }
-            };
-            let copy = scratch("backdrop_copy", wgpu::TextureUsages::COPY_DST);
-            let blur = scratch("backdrop_blur", wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let mut replaced = false;
+        if let Some(size) = self.copy.resize(self.frame, slot, copy_want) {
+            self.copy.scratch = Some(scratch(
+                "backdrop_copy",
+                size,
+                wgpu::TextureUsages::COPY_DST,
+            ));
+            self.copy.size = size;
+            self.copy.created = self.frame;
+            replaced = true;
+        }
+        if let Some(size) = self.blur.resize(self.frame, slot, blur_want) {
+            self.blur.scratch = Some(scratch(
+                "backdrop_blur",
+                size,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            ));
+            self.blur.size = size;
+            self.blur.created = self.frame;
+            replaced = true;
+        }
+        if let (true, Some(copy), Some(blur)) = (replaced, &self.copy.scratch, &self.blur.scratch) {
             let textures = |label, source: &Scratch, destination: &Scratch| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some(label),
@@ -334,19 +376,17 @@ impl WgpuBackdrop {
                     ],
                 })
             };
-            self.horizontal_textures = Some(textures("backdrop_horizontal_textures", &copy, &copy));
-            self.vertical_textures = Some(textures("backdrop_vertical_textures", &blur, &copy));
-            self.copy = Some(copy);
-            self.blur = Some(blur);
-            self.scratch_size = (width, height);
-            self.pool.created = self.pool.frame;
+            self.horizontal_textures = Some(textures("backdrop_horizontal_textures", copy, copy));
+            self.vertical_textures = Some(textures("backdrop_vertical_textures", blur, copy));
         }
 
         // Two entries per filter: horizontal, then vertical.
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         self.uniform_stride = PARAMS_SIZE.next_multiple_of(alignment);
         let needed = self.uniform_stride * 2 * backdrops.len() as u64;
-        let mut data = vec![0u8; needed as usize];
+        let data = &mut self.uniform_data;
+        data.clear();
+        data.resize(needed as usize, 0);
         for (index, (backdrop, plan)) in backdrops.iter().zip(&self.plans).enumerate() {
             let Some(plan) = plan else { continue };
             for (pass, kernel) in [&plan.horizontal, &plan.vertical].into_iter().enumerate() {
@@ -376,8 +416,12 @@ impl WgpuBackdrop {
         let Some(uniforms) = self.uniforms.as_ref() else {
             return;
         };
-        queue.write_buffer(uniforms, 0, &data);
-        // Rebuilt each frame with a filter: the chain buffer can be re-created between frames.
+        queue.write_buffer(uniforms, 0, data);
+        // The chain buffer can be re-created (and grown) between frames: rebind only when it or the uniforms changed.
+        let bound = (uniforms.clone(), rounded_clips.clone(), rounded_clips_size);
+        if self.params_bind_group.is_some() && self.params_bound.as_ref() == Some(&bound) {
+            return;
+        }
         self.params_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("backdrop_params"),
             layout: &pipelines.params_layout,
@@ -400,6 +444,7 @@ impl WgpuBackdrop {
                 },
             ],
         }));
+        self.params_bound = Some(bound);
     }
 
     /// Encode filter `index` of this frame's `Scene::backdrops` (between render passes): copy, horizontal, vertical.
@@ -422,8 +467,8 @@ impl WgpuBackdrop {
             Some(vertical_textures),
         ) = (
             &self.pipelines,
-            &self.copy,
-            &self.blur,
+            &self.copy.scratch,
+            &self.blur.scratch,
             &self.params_bind_group,
             &self.horizontal_textures,
             &self.vertical_textures,
@@ -453,8 +498,9 @@ impl WgpuBackdrop {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &blur.view,
                     resolve_target: None,
+                    // The pass rewrites every texel of its viewport, and nothing outside it is read.
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -500,10 +546,7 @@ impl WgpuBackdrop {
     /// Bytes held by the scratch textures (the memory counters).
     #[allow(dead_code)]
     pub(crate) fn scratch_bytes(&self) -> u64 {
-        if self.copy.is_none() {
-            return 0;
-        }
-        2 * 4 * u64::from(self.scratch_size.0) * u64::from(self.scratch_size.1)
+        self.copy.bytes() + self.blur.bytes()
     }
 }
 

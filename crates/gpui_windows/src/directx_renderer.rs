@@ -366,7 +366,7 @@ impl DirectXRenderer {
         self.upload_scene_buffers(scene)?;
         self.upload_rounded_clips(&scene.rounded_clips)?;
         if let Some(backdrop) = &mut self.backdrop {
-            backdrop.begin_frame(!scene.backdrops.is_empty());
+            backdrop.begin_frame();
         }
 
         let annotation = self
