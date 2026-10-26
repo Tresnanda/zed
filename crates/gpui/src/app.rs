@@ -1403,7 +1403,8 @@ impl App {
     /// when the app uses a dark theme while the system is in light mode (or vice versa)
     /// so the window edges render to match the theme. While an appearance is forced,
     /// windows stop tracking system light/dark changes; pass `None` to resume following
-    /// the system. On other platforms this is a no-op.
+    /// the system. Kybern: on Windows it sets DWM dark mode (the title bar and the Mica/Acrylic tint) and the windows
+    /// keep reporting the system's appearance. On other platforms this is a no-op.
     pub fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
         self.platform.set_window_appearance(appearance);
     }

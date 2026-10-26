@@ -1241,7 +1241,8 @@ impl WindowsWindowInner {
 
                     callback();
                     self.state.callbacks.appearance_changed.set(Some(callback));
-                    configure_dwm_dark_mode(handle, new_appearance);
+                    // Kybern: the window still reports the system's appearance, but DWM keeps the app's override.
+                    configure_dwm_dark_mode(handle, dwm_appearance(new_appearance));
                 }
             }
         }

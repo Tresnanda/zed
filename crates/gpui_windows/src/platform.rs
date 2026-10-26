@@ -600,6 +600,17 @@ impl Platform for WindowsPlatform {
         system_appearance().log_err().unwrap_or_default()
     }
 
+    /// Kybern: sets every window's `DWMWA_USE_IMMERSIVE_DARK_MODE` (title bar, Mica and Acrylic tint) to the app's theme,
+    /// and keeps it there when the system theme changes. Unlike macOS, `window_appearance` and the windows' `appearance`
+    /// keep reporting the system's, which is what an app's "follow the system" theme reads.
+    fn set_window_appearance(&self, appearance: Option<WindowAppearance>) {
+        set_dwm_appearance_override(appearance);
+        let system = self.window_appearance();
+        for handle in self.raw_window_handles.read().iter() {
+            configure_dwm_dark_mode(handle.as_raw(), dwm_appearance(system));
+        }
+    }
+
     fn open_url(&self, url: &str) {
         if url.is_empty() {
             return;

@@ -130,6 +130,28 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     )
 }
 
+/// Kybern: the app's light/dark override of DWM dark mode (`Platform::set_window_appearance`): 0 follows the system,
+/// 1 light, 2 dark. Global like macOS's `NSApplication.appearance`, so windows opened later take it too.
+static DWM_APPEARANCE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn set_dwm_appearance_override(appearance: Option<WindowAppearance>) {
+    let value = match appearance {
+        None => 0,
+        Some(WindowAppearance::Light | WindowAppearance::VibrantLight) => 1,
+        Some(WindowAppearance::Dark | WindowAppearance::VibrantDark) => 2,
+    };
+    DWM_APPEARANCE_OVERRIDE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The appearance DWM draws a window's title bar and system backdrop (Mica, Acrylic) in: the app's override, else `system`.
+pub(crate) fn dwm_appearance(system: WindowAppearance) -> WindowAppearance {
+    match DWM_APPEARANCE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => WindowAppearance::Light,
+        2 => WindowAppearance::Dark,
+        _ => system,
+    }
+}
+
 /// This function is used to configure the dark mode for the window built-in title bar.
 pub(crate) fn configure_dwm_dark_mode(hwnd: HWND, appearance: WindowAppearance) {
     let dark_mode_enabled: BOOL = match appearance {
