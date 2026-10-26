@@ -887,7 +887,11 @@ impl PlatformWindow for WindowsWindow {
         };
         if system_backdrops {
             dwm_set_window_composition_attribute(hwnd, system_backdrop.unwrap_or(1)); // DWMSBT_NONE
-            let extent = if system_backdrop.is_some() { -1 } else { 0 };
+            // KYBERN_DWM_EXTEND_FRAME=0 leaves the frame alone: the control for whether a DirectComposition window needs
+            // the extension to show the backdrop (the extension can also make DWM draw its caption buttons).
+            static EXTEND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let extend = *EXTEND.get_or_init(|| !std::env::var("KYBERN_DWM_EXTEND_FRAME").is_ok_and(|value| value == "0"));
+            let extent = if system_backdrop.is_some() && extend { -1 } else { 0 };
             let margins = MARGINS { cxLeftWidth: extent, cxRightWidth: extent, cyTopHeight: extent, cyBottomHeight: extent };
             unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }.log_err();
         }
