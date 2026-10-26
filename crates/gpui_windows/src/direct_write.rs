@@ -558,17 +558,27 @@ impl DirectWriteState {
             gpui::font_name_with_fallbacks_shared(&family, &system_ui_font_name)
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
-        let font_family_h = HSTRING::from(family.as_str());
-        let font = unsafe {
+        let mut font_family_h = HSTRING::from(family.as_str());
+        let matching = |family: &HSTRING| unsafe {
             fontset
                 .GetMatchingFonts(
-                    &font_family_h,
+                    family,
                     font_weight_to_dwrite(weight),
                     DWRITE_FONT_STRETCH_NORMAL,
                     font_style_to_dwrite(style),
                 )
-                .log_err()?
+                .log_err()
         };
+        let mut font = matching(&font_family_h)?;
+        // Kybern: a variable font's named instances are listed under their weight-stretch-style
+        // family, which can differ from the typographic family the app names (`Inter Variable`).
+        if unsafe { font.GetFontCount() } == 0
+            && let Some(wws_family) = unsafe { wws_family_name(&fontset, &font_family_h) }
+        {
+            font_debug(|| format!("{family}: matched as the WWS family {wws_family}"));
+            font_family_h = wws_family;
+            font = matching(&font_family_h)?;
+        }
         let total_number = unsafe { font.GetFontCount() };
         font_debug(|| {
             format!(
@@ -822,6 +832,14 @@ impl DirectWriteState {
         let rendering_mode = match rendering_mode {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             m => m,
+        };
+        // Kybern: unhinted outlines, as Core Text draws them, so cap heights and stems land where
+        // they do on macOS (layout positions are unhinted already). `KYBERN_TEXT_HINTING=1` keeps
+        // DirectWrite's grid fitting.
+        let grid_fit_mode = if text_hinting() {
+            grid_fit_mode
+        } else {
+            DWRITE_GRID_FIT_MODE_DISABLED
         };
 
         let antialias_mode = if params.subpixel_rendering {
@@ -1920,6 +1938,38 @@ unsafe fn weight_variation(
         };
         Some((face, axis_values))
     }
+}
+
+/// Kybern: the weight-stretch-style family `family` is listed under in `fontset`, when `family`
+/// is a typographic family name there (the shortest, when its instances span several).
+unsafe fn wws_family_name(fontset: &IDWriteFontSet, family: &HSTRING) -> Option<HSTRING> {
+    unsafe {
+        let property = DWRITE_FONT_PROPERTY {
+            propertyId: DWRITE_FONT_PROPERTY_ID_TYPOGRAPHIC_FAMILY_NAME,
+            propertyValue: PCWSTR(family.as_ptr()),
+            localeName: w!(""),
+        };
+        let typographic = fontset.GetMatchingFonts2(&[property]).log_err()?;
+        if typographic.GetFontCount() == 0 {
+            return None;
+        }
+        let names = typographic
+            .GetPropertyValues(DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME)
+            .log_err()?;
+        (0..names.GetCount())
+            .filter_map(|index| {
+                let length = names.GetStringLength(index).ok()? as usize;
+                let mut name = vec![0u16; length + 1];
+                names.GetString(index, &mut name).ok()?;
+                Some(HSTRING::from_wide(&name[..length]))
+            })
+            .min_by_key(|name| name.len())
+    }
+}
+
+fn text_hinting() -> bool {
+    static HINTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HINTING.get_or_init(|| std::env::var("KYBERN_TEXT_HINTING").is_ok_and(|value| value == "1"))
 }
 
 /// Kybern: `KYBERN_FONT_DEBUG=1` prints how fonts are matched and varied (stderr), for the
