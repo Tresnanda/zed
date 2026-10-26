@@ -570,6 +570,12 @@ impl DirectWriteState {
                 .log_err()?
         };
         let total_number = unsafe { font.GetFontCount() };
+        font_debug(|| {
+            format!(
+                "{family} weight {} style {style:?}: {total_number} matching fonts",
+                weight.0
+            )
+        });
         for index in 0..total_number {
             let res = maybe!({
                 let font_face_ref = unsafe { font.GetFontFaceReference(index).log_err()? };
@@ -1873,22 +1879,60 @@ unsafe fn weight_variation(
         let mut axis_values =
             vec![DWRITE_FONT_AXIS_VALUE::default(); face.GetFontAxisValueCount() as usize];
         face.GetFontAxisValues(&mut axis_values).log_err()?;
-        match axis_values
-            .iter_mut()
+        let current = axis_values
+            .iter()
             .find(|value| value.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT)
-        {
-            Some(value) if (value.value - target).abs() < 0.5 => return None,
-            Some(value) => value.value = target,
-            None => axis_values.push(DWRITE_FONT_AXIS_VALUE {
-                axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
-                value: target,
-            }),
-        }
-        let varied = resource
-            .CreateFontFace(face.GetSimulations(), &axis_values)
-            .log_err()?;
-        Some((varied.cast().log_err()?, axis_values))
+            .map(|value| value.value);
+        font_debug(|| {
+            format!(
+                "weight {} on a variable face: wght {:?} in {}..{}, axes {:?}",
+                weight.0,
+                current,
+                range.minValue,
+                range.maxValue,
+                axis_values
+                    .iter()
+                    .map(|value| (tag_name(value.axisTag.0), value.value))
+                    .collect::<Vec<_>>()
+            )
+        });
+        // The axis values go to the layout ranges even when the matched instance already has the
+        // weight: the layout matches its own font by family and weight, which need not be it.
+        let face: IDWriteFontFace3 = match current {
+            Some(value) if (value - target).abs() < 0.5 => face.cast().log_err()?,
+            _ => {
+                match axis_values
+                    .iter_mut()
+                    .find(|value| value.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT)
+                {
+                    Some(value) => value.value = target,
+                    None => axis_values.push(DWRITE_FONT_AXIS_VALUE {
+                        axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                        value: target,
+                    }),
+                }
+                resource
+                    .CreateFontFace(face.GetSimulations(), &axis_values)
+                    .log_err()?
+                    .cast()
+                    .log_err()?
+            }
+        };
+        Some((face, axis_values))
     }
+}
+
+/// Kybern: `KYBERN_FONT_DEBUG=1` prints how fonts are matched and varied (stderr), for the
+/// platform checks on machines nobody can attach to.
+fn font_debug(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("KYBERN_FONT_DEBUG").is_ok_and(|value| value == "1")) {
+        eprintln!("[font-debug] {}", message());
+    }
+}
+
+fn tag_name(tag: u32) -> String {
+    String::from_utf8_lossy(&tag.to_le_bytes()).into_owned()
 }
 
 /// Kybern: a variable face's family, style and `wght` (x 10), the key of `variation_ids`.
@@ -1921,8 +1965,9 @@ unsafe fn set_axis_values(
         return Ok(());
     }
     unsafe {
-        if let Some(layout) = layout.cast::<IDWriteTextLayout4>().log_err() {
-            layout.SetFontAxisValues(axis_values, range)?;
+        match layout.cast::<IDWriteTextLayout4>() {
+            Ok(layout) => layout.SetFontAxisValues(axis_values, range)?,
+            Err(error) => font_debug(|| format!("no IDWriteTextLayout4: {error}")),
         }
     }
     Ok(())
