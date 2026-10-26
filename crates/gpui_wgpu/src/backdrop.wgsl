@@ -116,7 +116,8 @@ fn fs_backdrop_vertical(input: Varying) -> @location(0) vec4<f32> {
         discard;
     }
     let luminance = dot(c.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let rgb = mix(vec3<f32>(luminance), c.rgb, params.values.y);
+    // Saturation above 1 pushes premultiplied channels outside 0..alpha (backdrop.metal).
+    let rgb = clamp(mix(vec3<f32>(luminance), c.rgb, params.values.y), vec3<f32>(0.0), vec3<f32>(blurred_alpha));
     var coverage = clamp(0.5 - distance, 0.0, 1.0) * params.viewport.z;
     var id = params.info.x;
     for (var link = 0u; link < 64u && id != 0u; link++) {

@@ -101,7 +101,8 @@ float4 backdrop_vertical_fragment(float4 position: SV_Position): SV_Target {
         discard;
     }
     float luminance = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
-    float3 rgb = lerp(float3(luminance, luminance, luminance), c.rgb, values.y);
+    // Saturation above 1 pushes premultiplied channels outside 0..alpha (backdrop.metal).
+    float3 rgb = clamp(lerp(float3(luminance, luminance, luminance), c.rgb, values.y), 0.0, blurred_alpha);
     float coverage = saturate(0.5 - distance) * target_info.z;
     uint id = info.x;
     [loop]
