@@ -126,6 +126,45 @@ pub fn served_frame_count() -> u64 {
     SERVED_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Kybern: one window's served frames off macOS, split by what the frame did.
+/// Shared with the embedder (`Window::frame_counters`) so it can read them from
+/// another thread without a round trip to the UI thread.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Default)]
+pub struct FrameCounters {
+    /// Frames that drew the window.
+    pub drawn: std::sync::atomic::AtomicU64,
+    /// Frames that only ran next-frame callbacks (nothing was dirty).
+    pub callbacks_only: std::sync::atomic::AtomicU64,
+}
+
+/// Kybern: whether the Wayland compositor has advertised a `wl_seat` (`None`
+/// before a Wayland client connected, or on X11 and Windows).
+#[cfg(not(target_os = "macos"))]
+pub fn wayland_seat() -> Option<bool> {
+    match WAYLAND_SEAT.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+static WAYLAND_SEAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Kybern: recorded by the Wayland client when it connects and when a seat
+/// appears; `None` again when the platform fell back to X11.
+#[cfg(not(target_os = "macos"))]
+#[doc(hidden)]
+pub fn set_wayland_seat(present: Option<bool>) {
+    let value = match present {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    WAYLAND_SEAT.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn frame_served() {
     SERVED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

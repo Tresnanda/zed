@@ -48,6 +48,7 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
                 if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty()) =>
             {
                 log::warn!("{error:#}; using X11 instead");
+                gpui::set_wayland_seat(None);
                 Rc::new(LinuxPlatform {
                     inner: X11Client::new()
                         .context("Failed to initialize X11 client.")

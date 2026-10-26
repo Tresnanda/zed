@@ -235,9 +235,9 @@ impl Globals {
         executor: ForegroundExecutor,
         qh: QueueHandle<WaylandClientStatePtr>,
         frame_ping: Ping,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let dialog_v = XdgWmDialogV1::interface().version;
-        Globals {
+        Ok(Globals {
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
                 .bind(
@@ -246,7 +246,7 @@ impl Globals {
                         ..=wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE,
                     (),
                 )
-                .unwrap(),
+                .map_err(|error| anyhow::anyhow!("binding wl_compositor: {error}"))?,
             cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
             data_device_manager: globals
                 .bind(
@@ -256,8 +256,14 @@ impl Globals {
                 )
                 .ok(),
             primary_selection_manager: globals.bind(&qh, 1..=1, ()).ok(),
-            shm: globals.bind(&qh, 1..=1, ()).unwrap(),
-            wm_base: globals.bind(&qh, 1..=5, ()).unwrap(),
+            // Kybern: a compositor without these cannot show a window; fail so
+            // `current_platform` can fall back to X11 instead of panicking.
+            shm: globals
+                .bind(&qh, 1..=1, ())
+                .map_err(|error| anyhow::anyhow!("binding wl_shm: {error}"))?,
+            wm_base: globals
+                .bind(&qh, 1..=5, ())
+                .map_err(|error| anyhow::anyhow!("binding xdg_wm_base: {error}"))?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -270,7 +276,7 @@ impl Globals {
             executor,
             qh,
             frame_ping,
-        }
+        })
     }
 }
 
@@ -862,12 +868,13 @@ impl WaylandClient {
         if seat.is_none() {
             log::warn!("wayland: the compositor has no wl_seat; input stays off until one appears");
         }
+        gpui::set_wayland_seat(Some(seat.is_some()));
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
             qh.clone(),
             frame_ping,
-        );
+        )?;
 
         let (data_device, primary_selection) = seat_devices(&globals, seat.as_ref(), &qh);
 
@@ -1435,6 +1442,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     state.data_device = data_device;
                     state.primary_selection = primary_selection;
                     state.wl_seat = Some(seat);
+                    gpui::set_wayland_seat(Some(true));
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
