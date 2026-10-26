@@ -13,7 +13,7 @@ path = "src/gpui_linux.rs"
 
 [features]
 default = ["wayland", "x11"]
-test-support = ["gpui/test-support"]
+test-support = ["gpui/test-support", "dep:image"]
 wayland = [
     "bitflags",
     "gpui_wgpu",
@@ -61,6 +61,7 @@ gpui.workspace = true
 gpui_util.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
 http_client.workspace = true
+image = { workspace = true, optional = true }
 libc.workspace = true
 log.workspace = true
 parking_lot.workspace = true

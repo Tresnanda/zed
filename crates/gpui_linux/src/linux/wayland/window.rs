@@ -1948,6 +1948,13 @@ impl PlatformWindow for WaylandWindow {
         self.0.schedule_frame();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let (width, height, pixels) = self.borrow_mut().renderer.render_to_rgba(scene)?;
+        image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow::anyhow!("the readback does not fill {width}x{height}"))
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let state = self.borrow();
         state.renderer.sprite_atlas().clone()
