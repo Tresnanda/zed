@@ -14,6 +14,7 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+pub mod backdrop_kernel;
 mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.

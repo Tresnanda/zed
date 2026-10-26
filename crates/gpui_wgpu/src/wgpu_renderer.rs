@@ -1,3 +1,4 @@
+use crate::wgpu_backdrop::{WgpuBackdrop, backdrop_filter_enabled};
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -204,6 +205,8 @@ struct WgpuResources {
     rounded_clips: Option<wgpu::Buffer>,
     /// Bytes of it this frame uses (the binding size, so `arrayLength` is the chain count).
     rounded_clips_size: u64,
+    /// Kybern: the scene backdrop filter's pipelines, scratches and uniforms.
+    backdrop: WgpuBackdrop,
 }
 
 /// Offscreen render target plus the buffer its pixels are copied into.
@@ -462,8 +465,15 @@ impl WgpuRenderer {
             );
         }
 
+        // Kybern: the backdrop filter copies the region behind it out of the frame; a surface without COPY_SRC keeps the
+        // filter's fallback (its translucent fill alone).
+        let backdrop_copy = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if backdrop_copy {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -650,6 +660,7 @@ impl WgpuRenderer {
             path_msaa_view: None,
             rounded_clips: None,
             rounded_clips_size: 0,
+            backdrop: WgpuBackdrop::default(),
         };
 
         Ok(Self {
@@ -1422,7 +1433,7 @@ impl WgpuRenderer {
 
         self.write_globals();
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
+        if let Err(error) = self.record_frame(scene, &frame.texture, &frame_view) {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
             return false;
@@ -1539,13 +1550,13 @@ impl WgpuRenderer {
     /// Records `scene` into the readback target and copies it into `pixels`.
     fn read_back(&mut self, scene: &Scene, width: u32, height: u32, pixels: &mut [u8]) -> Result<()> {
         let unpadded_bytes_per_row = width * 4;
-        let view = self
+        let (texture, view) = self
             .resources()
             .readback
             .as_ref()
-            .map(|readback| readback.view.clone())
+            .map(|readback| (readback.texture.clone(), readback.view.clone()))
             .context("readback target was just created")?;
-        self.record_frame(scene, &view)?;
+        self.record_frame(scene, &texture, &view)?;
 
         let resources = self.resources();
         let readback = resources
@@ -1654,9 +1665,30 @@ impl WgpuRenderer {
         });
     }
 
-    fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        frame_texture: &wgpu::Texture,
+        frame_view: &wgpu::TextureView,
+    ) -> Result<()> {
         if !self.uses_webgl_instance_data {
             self.write_rounded_clips(&scene.rounded_clips);
+        }
+        // Kybern: the backdrop filter needs the chain buffer (storage transport) and a frame it can copy from. Planned
+        // every frame, also without filters, so its scratch pool can release itself.
+        let backdrops = backdrop_filter_enabled()
+            && !self.uses_webgl_instance_data
+            && frame_texture.usage().contains(wgpu::TextureUsages::COPY_SRC);
+        {
+            let format = self.surface_config.format;
+            let (width, height) = (frame_texture.width(), frame_texture.height());
+            let resources = self.resources_mut();
+            if let Some(rounded_clips) = resources.rounded_clips.clone() {
+                let backdrop_list: &[gpui::Backdrop] = if backdrops { &scene.backdrops } else { &[] };
+                let rounded_clips_size = resources.rounded_clips_size;
+                let (device, queue) = (resources.device.clone(), resources.queue.clone());
+                resources.backdrop.prepare(&device, &queue, format, backdrop_list, width, height, &rounded_clips, rounded_clips_size);
+            }
         }
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -1699,8 +1731,29 @@ impl WgpuRenderer {
 
             for batch in scene.batches() {
                 match batch {
-                    // Kybern: no backdrop filter here; the translucent fill above it still paints.
-                    PrimitiveBatch::Backdrop(_) => {}
+                    // Kybern: the backdrop filter ends the pass, filters the region behind it and resumes; without the
+                    // filter (WebGL, no COPY_SRC, KYBERN_BACKDROP_FILTER=0) the translucent fill above it still paints.
+                    PrimitiveBatch::Backdrop(index) => {
+                        if !backdrops {
+                            continue;
+                        }
+                        drop(pass);
+                        self.resources().backdrop.encode(&mut encoder, index, frame_texture, frame_view);
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_after_backdrop"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                    }
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
                         &self.resources().pipelines.quads,
@@ -2579,6 +2632,65 @@ mod tests {
             SUBPIXEL_SHADERS,
             naga::valid::Capabilities::DUAL_SOURCE_BLENDING,
         );
+    }
+
+    #[test]
+    fn backdrop_shader_is_valid_wgsl() {
+        validate_wgsl(include_str!("backdrop.wgsl"), naga::valid::Capabilities::empty());
+    }
+
+    /// Kybern: the backdrop filter on a real adapter (Metal, Vulkan or lavapipe; skipped without one). Stripes behind a
+    /// rounded filter blur to their mean inside it, stay exact outside it and in its rounded-off corner, and what is
+    /// painted after the filter stays sharp.
+    #[test]
+    fn backdrop_filter_blurs_behind_and_keeps_later_content_sharp() {
+        use gpui::{Backdrop, Bounds, ContentMask, Hsla, Quad, point, size};
+        let Ok(context) = WgpuContext::new_offscreen() else {
+            eprintln!("no adapter: skipped");
+            return;
+        };
+        let (width, height) = (200, 120);
+        let target = size(DevicePixels(width), DevicePixels(height));
+        let mut renderer = WgpuRenderer::new_offscreen(&context, target).expect("offscreen renderer");
+        let whole = Bounds { origin: point(ScaledPixels(0.), ScaledPixels(0.)), size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)) };
+        let mask = ContentMask { bounds: whole, rounded_clip: 0, clip_generation: 0 };
+        let quad = |x: f32, y: f32, w: f32, h: f32, color: Hsla| Quad {
+            bounds: Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(w), ScaledPixels(h)) },
+            content_mask: mask.clone(),
+            background: color.into(),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., width as f32, height as f32, gpui::black()));
+        for stripe in (0..width).step_by(8) {
+            scene.insert_primitive(quad(stripe as f32, 0., 4., height as f32, gpui::white()));
+        }
+        let card = Bounds { origin: point(ScaledPixels(40.), ScaledPixels(20.)), size: size(ScaledPixels(120.), ScaledPixels(80.)) };
+        scene.insert_primitive(Backdrop { order: 0, bounds: card, content_mask: mask.clone(), blur: ScaledPixels(16.), radius: ScaledPixels(16.), saturation: 1., opacity: 1., fade_top: 0. });
+        scene.insert_primitive(quad(98., 40., 4., 40., gpui::red()));
+        scene.finish();
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        renderer.render_to_pixels(&scene, target, &mut pixels).expect("render");
+        let at = |x: i32, y: i32| {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        // Outside: exact stripes.
+        for x in 0..30 {
+            let expected = if x % 8 < 4 { 255 } else { 0 };
+            assert_eq!(at(x, 60)[0], expected, "outside x={x}");
+        }
+        // Inside, away from the halo: the stripes' mean, flat.
+        let row: Vec<f32> = (60..95).map(|x| at(x, 50)[1] as f32).collect();
+        let mean = row.iter().sum::<f32>() / row.len() as f32;
+        let spread = row.iter().map(|v| (v - mean).abs()).fold(0f32, f32::max);
+        assert!((mean - 127.5).abs() < 12., "blurred mean {mean}");
+        assert!(spread < 6., "blurred spread {spread}");
+        // The rounded-off corner keeps the destination.
+        assert!([0, 255].contains(&at(40, 20)[1]), "corner {:?}", at(40, 20));
+        // Painted after the filter: sharp.
+        assert_eq!(at(99, 60), [255, 0, 0, 255]);
+        assert!(at(96, 60)[0] < 200 && at(96, 60)[1] > 60, "neighbour of the sharp line {:?}", at(96, 60));
     }
 
     fn validate_wgsl(source: &str, capabilities: naga::valid::Capabilities) {
