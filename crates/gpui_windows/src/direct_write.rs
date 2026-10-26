@@ -80,13 +80,17 @@ struct DirectWriteState {
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
     font_to_font_id: HashMap<Font, FontId>,
-    font_info_cache: HashMap<usize, FontId>,
+    /// Faces by address. Kybern: each entry holds a reference to its face, so a face DirectWrite
+    /// created for a glyph run cannot be freed and its address reused by a different face.
+    font_info_cache: HashMap<usize, (FontId, IDWriteFontFace3)>,
     layout_line_scratch: Vec<u16>,
     /// Kybern: weight instances by (family, style, `wght` x 10), for glyph runs whose face is not
     /// the one `font_id` created (DirectWrite may build its own face from the layout's axis values).
+    /// Like every `FontInfo`, they are never evicted: GPUI holds font ids for the app's lifetime,
+    /// and the app asks for a handful of weights per family, so the list stays small.
     variation_ids: HashMap<(String, i32, i32), FontId>,
-    /// Kybern: `kszl` fonts with their scale, by the unscaled font they draw.
-    scaled_ids: HashMap<FontId, Vec<(f32, FontId)>>,
+    /// Kybern: fonts drawn at a `kszl` scale, by the unscaled font and the scale in per mille.
+    scaled_ids: HashMap<(FontId, u32), FontId>,
 }
 
 impl GPUState {
@@ -349,8 +353,10 @@ impl DirectWriteState {
             {
                 this.variation_ids.insert(key, font_id);
             }
+            let font_face = info.font_face.clone();
             this.fonts.push(info);
-            this.font_info_cache.insert(font_face_key, font_id);
+            this.font_info_cache
+                .insert(font_face_key, (font_id, font_face));
             Some(font_id)
         };
 
@@ -376,7 +382,8 @@ impl DirectWriteState {
     }
 
     /// Kybern: a `kszl` font is its unscaled font with a scale: the same face, never entered in
-    /// `font_info_cache` (glyph runs are told apart by their em size in `DrawGlyphRun`).
+    /// `font_info_cache` (a glyph run takes its scale from the input run it came from, in
+    /// `DrawGlyphRun`).
     fn select_scaled_font(
         &mut self,
         components: &DirectWriteComponents,
@@ -396,41 +403,40 @@ impl DirectWriteState {
             Some(&font_id) => font_id,
             None => self.select_and_cache_font(components, &unscaled_font)?,
         };
-        let info = &self.fonts[unscaled.0];
-        let info = FontInfo {
-            font_family_h: info.font_family_h.clone(),
-            font_face: info.font_face.clone(),
-            features: info.features.clone(),
-            fallbacks: info.fallbacks.clone(),
-            font_collection: info.font_collection.clone(),
-            axis_values: info.axis_values.clone(),
-            scale,
-        };
-        let font_id = FontId(self.fonts.len());
-        self.fonts.push(info);
-        self.scaled_ids
-            .entry(unscaled)
-            .or_default()
-            .push((scale, font_id));
+        let font_id = self.scaled_font(unscaled, scale);
         self.font_to_font_id.insert(font.clone(), font_id);
         Some(font_id)
     }
 
-    /// Kybern: the font of a glyph run drawn at `ratio` of the line's size: the `kszl` font of
-    /// `font_id` at that scale, if one asked for it.
-    fn scaled_for_run(&self, font_id: FontId, ratio: f32) -> FontId {
-        if (ratio - 1.0).abs() <= 0.005 {
+    /// Kybern: `font_id`'s face drawn at `scale` (rounded to 0.001), created on first use. Glyph
+    /// runs need one for whatever face they resolve to: several fonts share a face when only their
+    /// features or fallbacks differ, and fallback glyphs (emoji in inline code) come from another
+    /// face altogether.
+    fn scaled_font(&mut self, font_id: FontId, scale: f32) -> FontId {
+        let per_mille = (scale * 1000.0).round() as u32;
+        if per_mille == 1000 {
             return font_id;
         }
-        self.scaled_ids
-            .get(&font_id)
-            .and_then(|scaled| {
-                scaled
-                    .iter()
-                    .find(|(scale, _)| (scale - ratio).abs() < 0.01)
-                    .map(|(_, scaled)| *scaled)
-            })
-            .unwrap_or(font_id)
+        let unscaled = &self.fonts[font_id.0];
+        if unscaled.scale != 1.0 {
+            return font_id;
+        }
+        if let Some(&scaled) = self.scaled_ids.get(&(font_id, per_mille)) {
+            return scaled;
+        }
+        let info = FontInfo {
+            font_family_h: unscaled.font_family_h.clone(),
+            font_face: unscaled.font_face.clone(),
+            features: unscaled.features.clone(),
+            fallbacks: unscaled.fallbacks.clone(),
+            font_collection: unscaled.font_collection.clone(),
+            axis_values: unscaled.axis_values.clone(),
+            scale: per_mille as f32 / 1000.0,
+        };
+        let scaled = FontId(self.fonts.len());
+        self.fonts.push(info);
+        self.scaled_ids.insert((font_id, per_mille), scaled);
+        scaled
     }
 
     fn add_fonts(
@@ -640,6 +646,9 @@ impl DirectWriteState {
 
             let mut utf8_offset = 0usize;
             let mut utf16_offset = 0u32;
+            // Kybern: each input run's UTF-16 end and scale, so a glyph run is drawn at its own
+            // run's `kszl` scale whichever face it resolves to.
+            let mut run_scales = Vec::with_capacity(font_runs.len());
             let text_layout = {
                 let first_run = &font_runs[0];
                 let font_info = &self.fonts[first_run.font_id.0];
@@ -679,6 +688,7 @@ impl DirectWriteState {
                 }
                 set_axis_values(&layout, &font_info.axis_values, text_range)?;
                 utf16_offset += current_text_utf16_length;
+                run_scales.push((utf16_offset, font_info.scale));
 
                 layout
             };
@@ -705,6 +715,7 @@ impl DirectWriteState {
                     length: current_text_utf16_length,
                 };
                 utf16_offset += current_text_utf16_length;
+                run_scales.push((utf16_offset, font_info.scale));
                 text_layout.SetFontCollection(collection, text_range)?;
                 text_layout.SetFontFamilyName(&font_info.font_family_h, text_range)?;
                 let run_font_size = font_size.as_f32() * font_info.scale;
@@ -721,6 +732,12 @@ impl DirectWriteState {
 
                 break_ligatures = !break_ligatures;
             }
+            for range in emoji_presentation_ranges(text_wide) {
+                text_layout.SetFontCollection(&self.system_font_collection, range)?;
+                text_layout.SetFontFamilyName(w!("Segoe UI Emoji"), range)?;
+                text_layout.SetFontWeight(DWRITE_FONT_WEIGHT_NORMAL, range)?;
+                text_layout.SetFontStyle(DWRITE_FONT_STYLE_NORMAL, range)?;
+            }
 
             let mut runs = Vec::new();
             let mut renderer_context = RendererContext {
@@ -729,7 +746,7 @@ impl DirectWriteState {
                 index_converter: StringIndexConverter::new(text),
                 runs: &mut runs,
                 width: 0.0,
-                font_size: font_size.as_f32(),
+                run_scales: &run_scales,
             };
             text_layout.Draw(
                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
@@ -833,10 +850,11 @@ impl DirectWriteState {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             m => m,
         };
-        // Kybern: unhinted outlines, as Core Text draws them, so cap heights and stems land where
-        // they do on macOS (layout positions are unhinted already). `KYBERN_TEXT_HINTING=1` keeps
-        // DirectWrite's grid fitting.
-        let grid_fit_mode = if text_hinting() {
+        // Kybern: unhinted outlines on high-density displays, as Core Text draws them, so cap
+        // heights and stems land where they do on macOS (layout positions are unhinted already).
+        // At 1x and 1.25x DirectWrite's grid fitting keeps small text crisp. Glyph caches key on
+        // the scale factor. `KYBERN_TEXT_HINTING=1` grid-fits at every scale.
+        let grid_fit_mode = if text_hinting() || params.scale_factor < 1.5 {
             grid_fit_mode
         } else {
             DWRITE_GRID_FIT_MODE_DISABLED
@@ -1519,8 +1537,8 @@ struct RendererContext<'t, 'a, 'b> {
     index_converter: StringIndexConverter<'a>,
     runs: &'b mut Vec<ShapedRun>,
     width: f32,
-    /// Kybern: the line's font size, which a `kszl` run's em size is a fraction of.
-    font_size: f32,
+    /// Kybern: each input run's UTF-16 end and `kszl` scale, in order.
+    run_scales: &'b [(u32, f32)],
 }
 
 #[derive(Debug)]
@@ -1650,14 +1668,14 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             .text_system
             .font_info_cache
             .get(&font_face_key)
-            .copied()
+            .map(|(font_id, _)| *font_id)
             .or_else(|| {
                 let key = unsafe { variation_key(font_face, &self.locale) }?;
                 let font_id = *context.text_system.variation_ids.get(&key)?;
                 context
                     .text_system
                     .font_info_cache
-                    .insert(font_face_key, font_id);
+                    .insert(font_face_key, (font_id, font_face.clone()));
                 Some(font_id)
             })
             // in some circumstances, we might be getting served a FontFace that we did not create ourselves
@@ -1676,14 +1694,20 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     context
                         .text_system
                         .font_info_cache
-                        .insert(font_face_key, font_id);
+                        .insert(font_face_key, (font_id, font_face.clone()));
                     windows::core::Result::Ok(font_id)
                 },
                 Ok,
             )?;
-        let font_id = context
-            .text_system
-            .scaled_for_run(font_id, glyphrun.fontEmSize / context.font_size.max(0.01));
+        // Kybern: the face says nothing about a `kszl` scale (it is shared with the unscaled font
+        // and with fonts that differ only in features), so take it from the input run this glyph
+        // run starts in.
+        let run_scale = context
+            .run_scales
+            .iter()
+            .find(|(end, _)| desc.textPosition < *end)
+            .map_or(1.0, |(_, scale)| *scale);
+        let font_id = context.text_system.scaled_font(font_id, run_scale);
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
@@ -1965,6 +1989,46 @@ unsafe fn wws_family_name(fontset: &IDWriteFontSet, family: &HSTRING) -> Option<
             })
             .min_by_key(|name| name.len())
     }
+}
+
+/// Kybern: the UTF-16 ranges that ask for emoji presentation: a code point followed by U+FE0F
+/// (❤️, ⚠️, ☀️) and keycap sequences ending in U+20E3 (1️⃣). A text font such as Inter covers
+/// the base code point, so DirectWrite's fallback would never reach the colour face for them.
+/// Flags need a font with regional-indicator glyphs, which Segoe UI Emoji lacks.
+fn emoji_presentation_ranges(text: &[u16]) -> Vec<DWRITE_TEXT_RANGE> {
+    const VS16: u16 = 0xFE0F;
+    const KEYCAP: u16 = 0x20E3;
+    let mut ranges: Vec<DWRITE_TEXT_RANGE> = Vec::new();
+    let mut ix = 0;
+    while ix < text.len() {
+        let base_len = if text[ix] & 0xFC00 == 0xD800
+            && text.get(ix + 1).is_some_and(|low| low & 0xFC00 == 0xDC00)
+        {
+            2
+        } else {
+            1
+        };
+        let mut end = ix + base_len;
+        if text.get(end) == Some(&VS16) {
+            end += 1;
+        }
+        if text.get(end) == Some(&KEYCAP) {
+            end += 1;
+        }
+        if end > ix + base_len {
+            match ranges.last_mut() {
+                Some(last) if last.startPosition + last.length == ix as u32 => {
+                    last.length += (end - ix) as u32;
+                }
+                _ => ranges.push(DWRITE_TEXT_RANGE {
+                    startPosition: ix as u32,
+                    length: (end - ix) as u32,
+                }),
+            }
+        }
+        ix = end;
+    }
+    ranges
 }
 
 fn text_hinting() -> bool {

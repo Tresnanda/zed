@@ -126,13 +126,17 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        // A chosen family that does not resolve (or is `.SystemUIFont` itself) falls through to
+        // the platform's own UI font, keeping the requested weight and style.
         if font.family.as_ref() == ".SystemUIFont"
             && let Some(family) = self.system_ui_family.read().clone()
-        {
-            return self.font_id(&Font {
+            && family.as_ref() != ".SystemUIFont"
+            && let Ok(font_id) = self.font_id(&Font {
                 family,
                 ..font.clone()
-            });
+            })
+        {
+            return Ok(font_id);
         }
 
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
@@ -1256,5 +1260,91 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod system_ui_font_tests {
+    use super::*;
+    use crate::{NoopTextSystem, RenderGlyphParams};
+
+    /// Resolves only the families in `known`, to an id that encodes the family and weight.
+    struct Families {
+        known: &'static [&'static str],
+        noop: NoopTextSystem,
+    }
+
+    impl PlatformTextSystem for Families {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            self.noop.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn font_id(&self, font: &Font) -> Result<FontId> {
+            let family = self
+                .known
+                .iter()
+                .position(|known| *known == font.family.as_ref())
+                .with_context(|| format!("no family {}", font.family))?;
+            Ok(FontId(family * 1000 + font.weight.0 as usize))
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            self.noop.font_metrics(font_id)
+        }
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            self.noop.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            self.noop.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            self.noop.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            self.noop.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            self.noop.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.noop.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            self.noop.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    fn system_ui(weight: f32) -> Font {
+        Font {
+            weight: FontWeight(weight),
+            ..font(".SystemUIFont")
+        }
+    }
+
+    #[test]
+    fn missing_system_ui_family_keeps_weight() {
+        let text_system = TextSystem::new(Arc::new(Families {
+            known: &[".SystemUIFont", "Inter"],
+            noop: NoopTextSystem::new(),
+        }));
+        text_system.set_system_ui_font(Some("Inter".into()));
+        assert_eq!(text_system.font_id(&system_ui(600.)).unwrap(), FontId(1600));
+
+        text_system.set_system_ui_font(Some("Not Installed".into()));
+        assert_eq!(text_system.font_id(&system_ui(300.)).unwrap(), FontId(300));
+        assert_eq!(text_system.font_id(&system_ui(700.)).unwrap(), FontId(700));
+
+        // Naming the virtual family itself must not recurse.
+        text_system.set_system_ui_font(Some(".SystemUIFont".into()));
+        assert_eq!(text_system.font_id(&system_ui(500.)).unwrap(), FontId(500));
     }
 }

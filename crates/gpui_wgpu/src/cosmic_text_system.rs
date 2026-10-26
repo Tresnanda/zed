@@ -580,7 +580,7 @@ impl CosmicTextSystemState {
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
             .normalized_coords(loaded_font.coords.iter())
-            .hint(hinting())
+            .hint(hinting(params.scale_factor))
             .build();
 
         let sources: &[Source] = if params.is_emoji {
@@ -808,6 +808,20 @@ impl CosmicTextSystemState {
                     Some(ix) => &fallback_attrs[ix],
                 };
                 attrs_list.add_span(span.start..span.end, attrs);
+            }
+            // Kybern: a text font that covers ❤ would draw ❤️ as its text glyph; sequences that
+            // ask for emoji presentation go to the colour face, at the run's scale.
+            let mut emoji_attrs = None;
+            for range in emoji_presentation_ranges(&text[offs..run_end]) {
+                let attrs = emoji_attrs.get_or_insert_with(|| {
+                    properties.sized(
+                        Attrs::new()
+                            .metadata(run.font_id.0)
+                            .family(Family::Name(EMOJI_FAMILY)),
+                        font_size,
+                    )
+                });
+                attrs_list.add_span(offs + range.start..offs + range.end, attrs);
             }
             offs = run_end;
         }
@@ -1177,11 +1191,42 @@ fn face_info_into_properties(
     }
 }
 
-/// Kybern: glyphs are rasterized unhinted, as Core Text draws them, so their outlines match the
-/// unhinted advances layout uses (`Hinting::Disabled`). `KYBERN_TEXT_HINTING=1` hints them.
-fn hinting() -> bool {
+/// Kybern: on high-density displays glyphs are rasterized unhinted, as Core Text draws them, so
+/// their outlines match the unhinted advances layout uses (`Hinting::Disabled`). Below 1.5x they
+/// are hinted to stay crisp; glyph images are cached per scale factor. `KYBERN_TEXT_HINTING=1`
+/// hints at every scale.
+fn hinting(scale_factor: f32) -> bool {
     static HINTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HINTING.get_or_init(|| std::env::var("KYBERN_TEXT_HINTING").is_ok_and(|value| value == "1"))
+    scale_factor < 1.5
+        || *HINTING
+            .get_or_init(|| std::env::var("KYBERN_TEXT_HINTING").is_ok_and(|value| value == "1"))
+}
+
+/// Kybern: the colour emoji family the Linux runners and desktops install.
+const EMOJI_FAMILY: &str = "Noto Color Emoji";
+
+/// Kybern: the byte ranges of `text` that ask for emoji presentation: a character followed by
+/// U+FE0F (❤️, ⚠️, ☀️) and keycap sequences ending in U+20E3 (1️⃣).
+fn emoji_presentation_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, _)) = chars.next() {
+        let mut end = None;
+        if let Some(&(ix, '\u{FE0F}')) = chars.peek() {
+            end = Some(ix + '\u{FE0F}'.len_utf8());
+            chars.next();
+        }
+        if let Some(&(ix, '\u{20E3}')) = chars.peek() {
+            end = Some(ix + '\u{20E3}'.len_utf8());
+            chars.next();
+        }
+        let Some(end) = end else { continue };
+        match ranges.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => ranges.push(start..end),
+        }
+    }
+    ranges
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
@@ -1192,6 +1237,22 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_presentation_sequences() {
+        assert_eq!(emoji_presentation_ranges("a ❤ b"), Vec::<Range<usize>>::new());
+        let text = "a ❤\u{FE0F}\u{26A0}\u{FE0F} 1\u{FE0F}\u{20E3} #\u{20E3}";
+        let ranges = emoji_presentation_ranges(text);
+        let slices: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(
+            slices,
+            [
+                "❤\u{FE0F}\u{26A0}\u{FE0F}",
+                "1\u{FE0F}\u{20E3}",
+                "#\u{20E3}"
+            ]
+        );
+    }
 
     fn fid(i: usize) -> FontId {
         FontId(i)
