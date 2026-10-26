@@ -33,6 +33,11 @@ struct FontInfo {
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
     font_collection: IDWriteFontCollection1,
+    /// Kybern: every axis value of a variable face moved to the requested `wght`, applied to the
+    /// face's layout ranges too; empty for a face drawn as matched.
+    axis_values: Vec<DWRITE_FONT_AXIS_VALUE>,
+    /// Kybern: the size scale of the `kszl` pseudo feature (rich-editor inline code), 1 otherwise.
+    scale: f32,
 }
 
 pub(crate) struct DirectWriteTextSystem {
@@ -77,6 +82,11 @@ struct DirectWriteState {
     font_to_font_id: HashMap<Font, FontId>,
     font_info_cache: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
+    /// Kybern: weight instances by (family, style, `wght` x 10), for glyph runs whose face is not
+    /// the one `font_id` created (DirectWrite may build its own face from the layout's axis values).
+    variation_ids: HashMap<(String, i32, i32), FontId>,
+    /// Kybern: `kszl` fonts with their scale, by the unscaled font they draw.
+    scaled_ids: HashMap<FontId, Vec<(f32, FontId)>>,
 }
 
 impl GPUState {
@@ -214,6 +224,8 @@ impl DirectWriteTextSystem {
                 font_to_font_id: HashMap::default(),
                 font_info_cache: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                variation_ids: HashMap::default(),
+                scaled_ids: HashMap::default(),
             }),
         })
     }
@@ -287,6 +299,14 @@ impl PlatformTextSystem for DirectWriteTextSystem {
             })
     }
 
+    fn font_scale(&self, font_id: FontId) -> f32 {
+        self.state
+            .read()
+            .fonts
+            .get(font_id.0)
+            .map_or(1.0, |font| font.scale)
+    }
+
     fn recommended_rendering_mode(
         &self,
         _font_id: FontId,
@@ -306,6 +326,9 @@ impl DirectWriteState {
         components: &DirectWriteComponents,
         font: &Font,
     ) -> Option<FontId> {
+        if let Some(scale) = kszl_scale(&font.features) {
+            return self.select_scaled_font(components, font, scale);
+        }
         let select_font = |this: &mut DirectWriteState, font: &Font| -> Option<FontId> {
             let info = [&this.custom_font_collection, &this.system_font_collection]
                 .into_iter()
@@ -321,6 +344,11 @@ impl DirectWriteState {
 
             let font_id = FontId(this.fonts.len());
             let font_face_key = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+            if !info.axis_values.is_empty()
+                && let Some(key) = unsafe { variation_key(&info.font_face, &components.locale) }
+            {
+                this.variation_ids.insert(key, font_id);
+            }
             this.fonts.push(info);
             this.font_info_cache.insert(font_face_key, font_id);
             Some(font_id)
@@ -345,6 +373,64 @@ impl DirectWriteState {
         let font_id = font_id?;
         self.font_to_font_id.insert(font.clone(), font_id);
         Some(font_id)
+    }
+
+    /// Kybern: a `kszl` font is its unscaled font with a scale: the same face, never entered in
+    /// `font_info_cache` (glyph runs are told apart by their em size in `DrawGlyphRun`).
+    fn select_scaled_font(
+        &mut self,
+        components: &DirectWriteComponents,
+        font: &Font,
+        scale: f32,
+    ) -> Option<FontId> {
+        let mut unscaled_font = font.clone();
+        unscaled_font.features = FontFeatures(std::sync::Arc::new(
+            font.features
+                .0
+                .iter()
+                .filter(|(tag, _)| tag != "kszl")
+                .cloned()
+                .collect(),
+        ));
+        let unscaled = match self.font_to_font_id.get(&unscaled_font) {
+            Some(&font_id) => font_id,
+            None => self.select_and_cache_font(components, &unscaled_font)?,
+        };
+        let info = &self.fonts[unscaled.0];
+        let info = FontInfo {
+            font_family_h: info.font_family_h.clone(),
+            font_face: info.font_face.clone(),
+            features: info.features.clone(),
+            fallbacks: info.fallbacks.clone(),
+            font_collection: info.font_collection.clone(),
+            axis_values: info.axis_values.clone(),
+            scale,
+        };
+        let font_id = FontId(self.fonts.len());
+        self.fonts.push(info);
+        self.scaled_ids
+            .entry(unscaled)
+            .or_default()
+            .push((scale, font_id));
+        self.font_to_font_id.insert(font.clone(), font_id);
+        Some(font_id)
+    }
+
+    /// Kybern: the font of a glyph run drawn at `ratio` of the line's size: the `kszl` font of
+    /// `font_id` at that scale, if one asked for it.
+    fn scaled_for_run(&self, font_id: FontId, ratio: f32) -> FontId {
+        if (ratio - 1.0).abs() <= 0.005 {
+            return font_id;
+        }
+        self.scaled_ids
+            .get(&font_id)
+            .and_then(|scaled| {
+                scaled
+                    .iter()
+                    .find(|(scale, _)| (scale - ratio).abs() < 0.01)
+                    .map(|(_, scaled)| *scaled)
+            })
+            .unwrap_or(font_id)
     }
 
     fn add_fonts(
@@ -472,22 +558,43 @@ impl DirectWriteState {
             gpui::font_name_with_fallbacks_shared(&family, &system_ui_font_name)
         };
         let fontset = unsafe { collection.GetFontSet().log_err()? };
-        let font_family_h = HSTRING::from(family.as_str());
-        let font = unsafe {
+        let mut font_family_h = HSTRING::from(family.as_str());
+        let matching = |family: &HSTRING| unsafe {
             fontset
                 .GetMatchingFonts(
-                    &font_family_h,
+                    family,
                     font_weight_to_dwrite(weight),
                     DWRITE_FONT_STRETCH_NORMAL,
                     font_style_to_dwrite(style),
                 )
-                .log_err()?
+                .log_err()
         };
+        let mut font = matching(&font_family_h)?;
+        // Kybern: a variable font's named instances are listed under their weight-stretch-style
+        // family, which can differ from the typographic family the app names (`Inter Variable`).
+        if unsafe { font.GetFontCount() } == 0
+            && let Some(wws_family) = unsafe { wws_family_name(&fontset, &font_family_h) }
+        {
+            font_debug(|| format!("{family}: matched as the WWS family {wws_family}"));
+            font_family_h = wws_family;
+            font = matching(&font_family_h)?;
+        }
         let total_number = unsafe { font.GetFontCount() };
+        font_debug(|| {
+            format!(
+                "{family} weight {} style {style:?}: {total_number} matching fonts",
+                weight.0
+            )
+        });
         for index in 0..total_number {
             let res = maybe!({
                 let font_face_ref = unsafe { font.GetFontFaceReference(index).log_err()? };
                 let font_face = unsafe { font_face_ref.CreateFontFace().log_err()? };
+                let (font_face, axis_values) = match unsafe { weight_variation(&font_face, weight) }
+                {
+                    Some((varied, axis_values)) => (varied, axis_values),
+                    None => (font_face, Vec::new()),
+                };
                 let direct_write_features =
                     unsafe { Self::generate_font_features(factory, features).log_err()? };
                 let fallbacks = fallbacks.as_ref().and_then(|fallbacks| {
@@ -501,6 +608,8 @@ impl DirectWriteState {
                     features: direct_write_features,
                     fallbacks,
                     font_collection: collection.clone(),
+                    axis_values,
+                    scale: 1.0,
                 };
                 Some(font_info)
             });
@@ -565,6 +674,10 @@ impl DirectWriteState {
                     length: current_text_utf16_length,
                 };
                 layout.SetTypography(&font_info.features, text_range)?;
+                if font_info.scale != 1.0 {
+                    layout.SetFontSize(font_size.as_f32() * font_info.scale, text_range)?;
+                }
+                set_axis_values(&layout, &font_info.axis_values, text_range)?;
                 utf16_offset += current_text_utf16_length;
 
                 layout
@@ -594,15 +707,17 @@ impl DirectWriteState {
                 utf16_offset += current_text_utf16_length;
                 text_layout.SetFontCollection(collection, text_range)?;
                 text_layout.SetFontFamilyName(&font_info.font_family_h, text_range)?;
-                let font_size = if break_ligatures {
-                    font_size.as_f32().next_up()
+                let run_font_size = font_size.as_f32() * font_info.scale;
+                let run_font_size = if break_ligatures {
+                    run_font_size.next_up()
                 } else {
-                    font_size.as_f32()
+                    run_font_size
                 };
-                text_layout.SetFontSize(font_size, text_range)?;
+                text_layout.SetFontSize(run_font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
+                set_axis_values(&text_layout, &font_info.axis_values, text_range)?;
 
                 break_ligatures = !break_ligatures;
             }
@@ -614,6 +729,7 @@ impl DirectWriteState {
                 index_converter: StringIndexConverter::new(text),
                 runs: &mut runs,
                 width: 0.0,
+                font_size: font_size.as_f32(),
             };
             text_layout.Draw(
                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
@@ -716,6 +832,14 @@ impl DirectWriteState {
         let rendering_mode = match rendering_mode {
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             m => m,
+        };
+        // Kybern: unhinted outlines, as Core Text draws them, so cap heights and stems land where
+        // they do on macOS (layout positions are unhinted already). `KYBERN_TEXT_HINTING=1` keeps
+        // DirectWrite's grid fitting.
+        let grid_fit_mode = if text_hinting() {
+            grid_fit_mode
+        } else {
+            DWRITE_GRID_FIT_MODE_DISABLED
         };
 
         let antialias_mode = if params.subpixel_rendering {
@@ -1395,6 +1519,8 @@ struct RendererContext<'t, 'a, 'b> {
     index_converter: StringIndexConverter<'a>,
     runs: &'b mut Vec<ShapedRun>,
     width: f32,
+    /// Kybern: the line's font size, which a `kszl` run's em size is a fraction of.
+    font_size: f32,
 }
 
 #[derive(Debug)]
@@ -1525,6 +1651,15 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             .font_info_cache
             .get(&font_face_key)
             .copied()
+            .or_else(|| {
+                let key = unsafe { variation_key(font_face, &self.locale) }?;
+                let font_id = *context.text_system.variation_ids.get(&key)?;
+                context
+                    .text_system
+                    .font_info_cache
+                    .insert(font_face_key, font_id);
+                Some(font_id)
+            })
             // in some circumstances, we might be getting served a FontFace that we did not create ourselves
             // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
             .map_or_else(
@@ -1546,6 +1681,9 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 },
                 Ok,
             )?;
+        let font_id = context
+            .text_system
+            .scaled_for_run(font_id, glyphrun.fontEmSize / context.font_size.max(0.01));
 
         let color_font = unsafe { font_face.IsColorFont().as_bool() };
 
@@ -1716,6 +1854,173 @@ impl<'a> StringIndexConverter<'a> {
         }
         self.utf8_ix = self.text.len();
     }
+}
+
+/// Kybern: the `kszl` pseudo feature (`text_scale_gpui.py`): a size scale in per mille, not an
+/// OpenType feature.
+fn kszl_scale(features: &FontFeatures) -> Option<f32> {
+    features
+        .0
+        .iter()
+        .find(|(tag, _)| tag == "kszl")
+        .map(|(_, value)| (*value as f32 / 1000.0).clamp(0.25, 4.0))
+}
+
+/// Kybern: `face` at `weight` on its `wght` axis, like Core Text (`font_weight.rs`), when it is
+/// a variable face whose instance is another weight: `GetMatchingFonts` only returns named
+/// instances, so a kit weight of 450, 550 or 650 would draw as the nearest one. Returns the new
+/// face and all of its axis values. `KYBERN_FONT_WEIGHT_AXIS=0` keeps the matched instance.
+unsafe fn weight_variation(
+    face: &IDWriteFontFace3,
+    weight: FontWeight,
+) -> Option<(IDWriteFontFace3, Vec<DWRITE_FONT_AXIS_VALUE>)> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED
+        .get_or_init(|| std::env::var("KYBERN_FONT_WEIGHT_AXIS").is_ok_and(|value| value == "0"))
+        || !weight.0.is_finite()
+    {
+        return None;
+    }
+    unsafe {
+        let face: IDWriteFontFace5 = face.cast().ok()?;
+        if !face.HasVariations().as_bool() {
+            return None;
+        }
+        let resource = face.GetFontResource().log_err()?;
+        let mut ranges =
+            vec![DWRITE_FONT_AXIS_RANGE::default(); resource.GetFontAxisCount() as usize];
+        resource.GetFontAxisRanges(&mut ranges).log_err()?;
+        let range = ranges.iter().find(|range| {
+            range.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT && range.maxValue > range.minValue
+        })?;
+        let target = weight.0.clamp(range.minValue, range.maxValue);
+        let mut axis_values =
+            vec![DWRITE_FONT_AXIS_VALUE::default(); face.GetFontAxisValueCount() as usize];
+        face.GetFontAxisValues(&mut axis_values).log_err()?;
+        let current = axis_values
+            .iter()
+            .find(|value| value.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT)
+            .map(|value| value.value);
+        font_debug(|| {
+            format!(
+                "weight {} on a variable face: wght {:?} in {}..{}, axes {:?}",
+                weight.0,
+                current,
+                range.minValue,
+                range.maxValue,
+                axis_values
+                    .iter()
+                    .map(|value| (tag_name(value.axisTag.0), value.value))
+                    .collect::<Vec<_>>()
+            )
+        });
+        // The axis values go to the layout ranges even when the matched instance already has the
+        // weight: the layout matches its own font by family and weight, which need not be it.
+        let face: IDWriteFontFace3 = match current {
+            Some(value) if (value - target).abs() < 0.5 => face.cast().log_err()?,
+            _ => {
+                match axis_values
+                    .iter_mut()
+                    .find(|value| value.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT)
+                {
+                    Some(value) => value.value = target,
+                    None => axis_values.push(DWRITE_FONT_AXIS_VALUE {
+                        axisTag: DWRITE_FONT_AXIS_TAG_WEIGHT,
+                        value: target,
+                    }),
+                }
+                resource
+                    .CreateFontFace(face.GetSimulations(), &axis_values)
+                    .log_err()?
+                    .cast()
+                    .log_err()?
+            }
+        };
+        Some((face, axis_values))
+    }
+}
+
+/// Kybern: the weight-stretch-style family `family` is listed under in `fontset`, when `family`
+/// is a typographic family name there (the shortest, when its instances span several).
+unsafe fn wws_family_name(fontset: &IDWriteFontSet, family: &HSTRING) -> Option<HSTRING> {
+    unsafe {
+        let property = DWRITE_FONT_PROPERTY {
+            propertyId: DWRITE_FONT_PROPERTY_ID_TYPOGRAPHIC_FAMILY_NAME,
+            propertyValue: PCWSTR(family.as_ptr()),
+            localeName: w!(""),
+        };
+        let typographic = fontset.GetMatchingFonts2(&[property]).log_err()?;
+        if typographic.GetFontCount() == 0 {
+            return None;
+        }
+        let names = typographic
+            .GetPropertyValues(DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME)
+            .log_err()?;
+        (0..names.GetCount())
+            .filter_map(|index| {
+                let length = names.GetStringLength(index).ok()? as usize;
+                let mut name = vec![0u16; length + 1];
+                names.GetString(index, &mut name).ok()?;
+                Some(HSTRING::from_wide(&name[..length]))
+            })
+            .min_by_key(|name| name.len())
+    }
+}
+
+fn text_hinting() -> bool {
+    static HINTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HINTING.get_or_init(|| std::env::var("KYBERN_TEXT_HINTING").is_ok_and(|value| value == "1"))
+}
+
+/// Kybern: `KYBERN_FONT_DEBUG=1` prints how fonts are matched and varied (stderr), for the
+/// platform checks on machines nobody can attach to.
+fn font_debug(message: impl FnOnce() -> String) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var("KYBERN_FONT_DEBUG").is_ok_and(|value| value == "1")) {
+        eprintln!("[font-debug] {}", message());
+    }
+}
+
+fn tag_name(tag: u32) -> String {
+    String::from_utf8_lossy(&tag.to_le_bytes()).into_owned()
+}
+
+/// Kybern: a variable face's family, style and `wght` (x 10), the key of `variation_ids`.
+unsafe fn variation_key(face: &IDWriteFontFace3, locale: &HSTRING) -> Option<(String, i32, i32)> {
+    unsafe {
+        let varied: IDWriteFontFace5 = face.cast().ok()?;
+        if !varied.HasVariations().as_bool() {
+            return None;
+        }
+        let mut axis_values =
+            vec![DWRITE_FONT_AXIS_VALUE::default(); varied.GetFontAxisValueCount() as usize];
+        varied.GetFontAxisValues(&mut axis_values).ok()?;
+        let weight = axis_values
+            .iter()
+            .find(|value| value.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT)?
+            .value;
+        let family = get_name(face.GetFamilyNames().ok()?, locale).ok()?;
+        Some((family, face.GetStyle().0, (weight * 10.0).round() as i32))
+    }
+}
+
+/// Kybern: a variable run's axis values on its layout range (`IDWriteTextLayout4`, Windows 10
+/// 2004); without them the layout would shape the matched named instance.
+unsafe fn set_axis_values(
+    layout: &IDWriteTextLayout,
+    axis_values: &[DWRITE_FONT_AXIS_VALUE],
+    range: DWRITE_TEXT_RANGE,
+) -> Result<()> {
+    if axis_values.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        match layout.cast::<IDWriteTextLayout4>() {
+            Ok(layout) => layout.SetFontAxisValues(axis_values, range)?,
+            Err(error) => font_debug(|| format!("no IDWriteTextLayout4: {error}")),
+        }
+    }
+    Ok(())
 }
 
 fn font_style_to_dwrite(style: FontStyle) -> DWRITE_FONT_STYLE {

@@ -56,6 +56,9 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    /// Kybern: the family `.SystemUIFont` stands for when the app chose one (a variable face
+    /// off macOS, where the platform's UI font is a static family).
+    system_ui_family: RwLock<Option<SharedString>>,
 }
 
 impl TextSystem {
@@ -64,9 +67,16 @@ impl TextSystem {
         self.platform_text_system.font_scale(font_id)
     }
 
+    /// Kybern: make `.SystemUIFont` resolve to `family`; `None` restores the platform's UI font.
+    /// Text laid out before keeps the font it resolved until it is laid out again.
+    pub fn set_system_ui_font(&self, family: Option<SharedString>) {
+        *self.system_ui_family.write() = family;
+    }
+
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         TextSystem {
+            system_ui_family: RwLock::default(),
             platform_text_system,
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
@@ -116,6 +126,15 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        if font.family.as_ref() == ".SystemUIFont"
+            && let Some(family) = self.system_ui_family.read().clone()
+        {
+            return self.font_id(&Font {
+                family,
+                ..font.clone()
+            });
+        }
+
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
