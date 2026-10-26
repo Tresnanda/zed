@@ -1829,21 +1829,32 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
+            // The last answer, for a hit test that arrives while the app is borrowed (a message
+            // pumped during an update): the pointer has not moved since, or Windows would have
+            // asked again outside it.
+            let last = Rc::new(Cell::new(None));
             Box::new(move || {
-                handle
-                    .update(&mut cx, |_, window, _cx| {
-                        // The topmost area under the pointer wins, so a control (`Client`)
-                        // inside a drag area is not part of the caption.
-                        let areas = &window.rendered_frame.window_control_hitboxes;
-                        for id in &window.mouse_hit_test.ids {
-                            if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
-                                return (*area != WindowControlArea::Client).then_some(*area);
-                            }
+                let answer = handle.update(&mut cx, |_, window, _cx| {
+                    // A fresh hit test where the pointer is now: `mouse_hit_test` is only as new as
+                    // the last mouse event GPUI dispatched, and Windows asks before it sends the
+                    // move or press that would update it. The topmost area wins, so a control
+                    // (`Client`) inside a drag area is not part of the caption.
+                    let hit = window.rendered_frame.hit_test(window.platform_window.mouse_position());
+                    let areas = &window.rendered_frame.window_control_hitboxes;
+                    for id in &hit.ids {
+                        if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
+                            return (*area != WindowControlArea::Client).then_some(*area);
                         }
-                        None
-                    })
-                    .log_err()
-                    .unwrap_or(None)
+                    }
+                    None
+                });
+                match answer {
+                    Ok(area) => {
+                        last.set(area);
+                        area
+                    }
+                    Err(_) => last.get(),
+                }
             })
         });
         platform_window.on_move_tab_to_new_window({
