@@ -141,7 +141,18 @@ impl Window {
             };
             *shared = geometry.clone();
             match &mut previous.paint_operations[index] {
-                crate::scene::PaintOperation::Primitive(p) => p.translate_subtree(*delta, *mask),
+                // Inside a paintTransform scope the next retained transform frame rebuilds the primitive from its
+                // untransformed base: move the base (the translation applies before the transform) and present it through
+                // its scope, or that frame shows the subtree back at its old offset.
+                crate::scene::PaintOperation::Primitive(p) => match previous.transform_bases.get_mut(&index) {
+                    Some((base, context)) => {
+                        base.translate_subtree(*delta, *mask);
+                        let mut moved = base.clone();
+                        moved.transform_subtree(context);
+                        *p = moved;
+                    }
+                    None => p.translate_subtree(*delta, *mask),
+                },
                 crate::scene::PaintOperation::StartLayer(bounds) => bounds.origin += *delta,
                 _ => {}
             }
@@ -153,8 +164,15 @@ impl Window {
                 if !geometry.translation_changed(&values) {
                     continue;
                 }
-                hitbox.bounds.origin += geometry.translate(&values);
+                let delta = geometry.translate(&values);
                 hitbox.content_mask = geometry.mask(&mut self.rounded_clip_pool, &mut scene, scale, viewport);
+                match &mut hitbox.transform_base {
+                    Some((base, context)) => {
+                        base.origin += delta;
+                        hitbox.bounds = context.visual_bounds(*base);
+                    }
+                    None => hitbox.bounds.origin += delta,
+                }
             }
         }
         scene.replay(0..previous.len(), &previous);
