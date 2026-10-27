@@ -177,6 +177,10 @@ impl MetalRenderer {
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
+        // The presented-frame dump reads every drawable back.
+        if present_dump_dir().is_some() {
+            layer.set_framebuffer_only(false);
+        }
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
@@ -609,6 +613,9 @@ impl MetalRenderer {
                 command_buffer
             }
         } else { command_buffer };
+        if present_dump_dir().is_some() {
+            self.dump_presented(&command_buffer, drawable.texture());
+        }
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -1508,6 +1515,78 @@ fn new_command_encoder_for_texture<'a>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+/// `KYBERN_PRESENT_DUMP=<dir>`: a debugging aid that writes every presented drawable to `<dir>/<frame>-<ms>.png` at half size,
+/// numbered in present order with milliseconds since the first one. What reached the screen, which the automation screenshot
+/// (a fresh render) cannot show: a frame that briefly mixes two states. Off and inert unless set.
+fn present_dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("KYBERN_PRESENT_DUMP").filter(|dir| !dir.is_empty()).map(std::path::PathBuf::from)).as_deref()
+}
+
+impl MetalRenderer {
+    /// Copies the drawable into a shared buffer on the frame's own command buffer (before it is committed); once the GPU is
+    /// done, a thread downsamples and writes it.
+    fn dump_presented(&self, command_buffer: &metal::CommandBufferRef, texture: &metal::TextureRef) {
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let Some(dir) = present_dump_dir() else { return };
+        let (width, height) = (texture.width(), texture.height());
+        if width == 0 || height == 0 {
+            return;
+        }
+        let row = width * 4;
+        let buffer = self.device.new_buffer(row * height, metal::MTLResourceOptions::StorageModeShared);
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize { width, height, depth: 1 },
+            &buffer,
+            0,
+            row,
+            row * height,
+            metal::MTLBlitOption::empty(),
+        );
+        blit.end_encoding();
+        let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ms = ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0;
+        if gpui::kybern_motion_trace_enabled() {
+            gpui::kybern_motion_trace(format_args!("present-dump {frame}"));
+        }
+        let path = dir.join(format!("{frame:06}-{ms:010.1}.png"));
+        let buffer = Cell::new(Some(buffer));
+        let block = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+            let Some(buffer) = buffer.take() else { return };
+            let length = (row * height) as usize;
+            // SAFETY: a shared buffer of `length` bytes the completed blit wrote.
+            let pixels = unsafe { slice::from_raw_parts(buffer.contents() as *const u8, length) }.to_vec();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let (width, height, row) = (width as usize, height as usize, row as usize);
+                let (out_width, out_height) = (width / 2, height / 2);
+                let mut out = vec![0u8; out_width * out_height * 3];
+                for y in 0..out_height {
+                    for x in 0..out_width {
+                        for channel in 0..3 {
+                            // BGRA in, RGB out: the average of each 2×2 block.
+                            let source = 2 - channel;
+                            let at = |dx: usize, dy: usize| pixels[(2 * y + dy) * row + (2 * x + dx) * 4 + source] as u32;
+                            out[(y * out_width + x) * 3 + channel] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+                        }
+                    }
+                }
+                if let Err(error) = image::save_buffer(&path, &out, out_width as u32, out_height as u32, image::ExtendedColorType::Rgb8) {
+                    log::error!("present dump {}: {error}", path.display());
+                }
+            });
+        });
+        let block = block.copy();
+        command_buffer.add_completed_handler(&block);
+    }
+}
+
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;
