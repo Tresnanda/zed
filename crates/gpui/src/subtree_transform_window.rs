@@ -209,6 +209,39 @@ impl SubtreeTransformContext {
         let scopes = self.scopes.iter().map(|(id, origin, old)| (*id, *origin, values.get(id).copied().unwrap_or(*old))).collect();
         Some(Self::build(scopes, self.boxes.clone(), self.outer.clone(), self.masks.clone(), self.scale_factor, pool, scene))
     }
+    /// The context of paint recorded under `recorded` and replayed (a cached island) under `self`: the active scopes, then
+    /// the recorded scopes nested inside the replayed range at their recorded values, with the masks pushed inside it.
+    /// None when nothing is nested (the active context applies as it is).
+    fn nest(&self, recorded: &Self, pool: &mut RoundedClipPool, scene: &mut Scene) -> Option<Self> {
+        let inner: Vec<usize> = (0..recorded.scopes.len()).filter(|&i| !self.contains(recorded.scopes[i].0)).collect();
+        if inner.is_empty() {
+            return None;
+        }
+        // A recorded depth (scopes active when a mask was pushed) in the nested scope list.
+        let depth = |recorded_depth: usize| -> usize {
+            let Some(last) = recorded_depth.checked_sub(1) else { return 0 };
+            match inner.iter().position(|&i| i == last) {
+                Some(position) => self.scopes.len() + position + 1,
+                // Pushed under an active scope only.
+                None => {
+                    let id = recorded.scopes[last].0;
+                    self.scopes.iter().position(|(scope, _, _)| *scope == id).map_or(0, |i| i + 1)
+                }
+            }
+        };
+        let scopes = self.scopes.iter().copied().chain(inner.iter().map(|&i| recorded.scopes[i])).collect();
+        let boxes = self.boxes.iter().copied().chain(inner.iter().map(|&i| recorded.boxes[i])).collect();
+        let mut masks = self.masks.clone();
+        for (bounds, rounded, recorded_depth) in &recorded.masks {
+            let at = depth(*recorded_depth);
+            // An ancestor's mask is already in the active context; one pushed inside the replayed range is not.
+            if at <= self.scopes.len() && self.masks.iter().any(|(b, _, d)| b == bounds && *d == at) {
+                continue;
+            }
+            masks.push((*bounds, *rounded, at));
+        }
+        Some(Self::build(scopes, boxes, self.outer.clone(), masks, self.scale_factor, pool, scene))
+    }
     fn contains(&self, id: u64) -> bool {
         self.scopes.iter().any(|(scope, _, _)| *scope == id)
     }
@@ -216,6 +249,12 @@ impl SubtreeTransformContext {
         let (x, y, w, h) = self.matrix.envelope(bounds.origin.x.as_f32(), bounds.origin.y.as_f32(), bounds.size.width.as_f32(), bounds.size.height.as_f32());
         Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
     }
+}
+
+/// `KYBERN_NESTED_SCOPE_REPLAY=0`: the A/B control, a cached range replayed inside a scope keeps only the active scopes.
+fn nested_scope_replay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KYBERN_NESTED_SCOPE_REPLAY").as_deref() != Ok("0"))
 }
 
 #[derive(Default)]
@@ -284,6 +323,58 @@ impl Window {
     fn pop_transform_mask(&mut self) {
         if self.subtree_transform.masks.pop().flatten().is_some() {
             self.sync_subtree_transform();
+        }
+    }
+    /// Before a cached range of the rendered scene replays inside the active scope: what each recorded context in it becomes.
+    pub(crate) fn prepare_transform_replay(&mut self, range: std::ops::Range<usize>) {
+        self.next_frame.scene.replay_transforms.clear();
+        let Some(active) = self.subtree_transform.context.clone() else { return };
+        if !nested_scope_replay() {
+            return;
+        }
+        for index in range {
+            let Some((_, recorded)) = self.rendered_frame.scene.transform_bases.get(&index) else { continue };
+            let key = std::sync::Arc::as_ptr(recorded) as usize;
+            if self.next_frame.scene.replay_transforms.contains_key(&key) {
+                continue;
+            }
+            let nested = active.nest(recorded, &mut self.rounded_clip_pool, &mut self.next_frame.scene).map_or_else(|| active.clone(), std::sync::Arc::new);
+            self.next_frame.scene.replay_transforms.insert(key, nested);
+        }
+    }
+    pub(crate) fn finish_transform_replay(&mut self) {
+        self.next_frame.scene.replay_transforms.clear();
+    }
+    /// Hitboxes of a cached range replayed inside the active scope follow it, and keep the scopes nested inside the range.
+    pub(crate) fn transform_replayed_hitboxes(&mut self, start: usize) {
+        let Some(active) = self.subtree_transform.context.clone() else { return };
+        if !nested_scope_replay() {
+            return;
+        }
+        let mut nested: std::collections::HashMap<usize, std::sync::Arc<SubtreeTransformContext>> = Default::default();
+        for index in start..self.next_frame.hitboxes.len() {
+            let hitbox = &self.next_frame.hitboxes[index];
+            let (base, context) = match &hitbox.transform_base {
+                Some((base, recorded)) => {
+                    let key = std::sync::Arc::as_ptr(recorded) as usize;
+                    let context = match nested.get(&key) {
+                        Some(context) => context.clone(),
+                        None => {
+                            let context = active
+                                .nest(recorded, &mut self.rounded_clip_pool, &mut self.next_frame.scene)
+                                .map_or_else(|| active.clone(), std::sync::Arc::new);
+                            nested.insert(key, context.clone());
+                            context
+                        }
+                    };
+                    (*base, context)
+                }
+                None => (hitbox.bounds, active.clone()),
+            };
+            let hitbox = &mut self.next_frame.hitboxes[index];
+            hitbox.bounds = context.visual_bounds(base);
+            hitbox.content_mask = context.visual_mask.clone();
+            hitbox.transform_base = Some((base, context));
         }
     }
     fn transform_hitbox(&self, mut hitbox: Hitbox) -> Hitbox {

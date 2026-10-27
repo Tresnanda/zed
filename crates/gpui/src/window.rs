@@ -3682,11 +3682,13 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let hitboxes_start = self.next_frame.hitboxes.len();
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
                 .cloned(),
         );
+        self.transform_replayed_hitboxes(hitboxes_start);
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -3792,10 +3794,12 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
+        self.prepare_transform_replay(range.start.scene_index..range.end.scene_index);
         self.next_frame.scene.replay(
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+        self.finish_transform_replay();
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

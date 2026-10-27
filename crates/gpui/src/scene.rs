@@ -43,6 +43,9 @@ pub struct Scene {
     pub(crate) active_transform: Option<std::sync::Arc<crate::window::SubtreeTransformContext>>,
     pub(crate) transform_bases: std::collections::HashMap<usize, (Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
     pending_transform_base: Option<(Primitive, std::sync::Arc<crate::window::SubtreeTransformContext>)>,
+    /// While a cached range replays inside an active scope: the context each recorded context becomes (the active scopes,
+    /// then the scopes nested inside the range), keyed by the recorded context's address. Empty otherwise.
+    pub(crate) replay_transforms: std::collections::HashMap<usize, std::sync::Arc<crate::window::SubtreeTransformContext>>,
     pub(crate) active_fade: Option<Vec<FadeWord>>,
     pub(crate) fade_tags: std::collections::HashMap<usize, FadeTag>,
     fade_slots: std::collections::HashMap<usize, (u8, usize)>,
@@ -100,6 +103,7 @@ impl Scene {
         self.transform_bases.clear();
         self.active_transform = None;
         self.pending_transform_base = None;
+        self.replay_transforms.clear();
         self.active_fade = None;
         self.fade_tags.clear();
         self.fade_slots.clear();
@@ -156,9 +160,17 @@ impl Scene {
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let transform_base = match (self.pending_transform_base.take(), self.active_transform.clone()) {
-            // Painted (or a cached range replayed) inside an active scope: map the untransformed base.
+            // Painted (or a cached range replayed) inside an active scope: map the untransformed base. A replayed primitive
+            // keeps the scopes nested inside its range (a fade held at 0 in a cached island under a scene's entrance): with
+            // only the active scopes it would present at its unscoped value until the next render.
             (pending, Some(context)) => {
-                let base = pending.map_or_else(|| primitive.clone(), |(base, _)| base);
+                let (base, context) = match pending {
+                    Some((base, recorded)) => {
+                        let nested = self.replay_transforms.get(&(std::sync::Arc::as_ptr(&recorded) as usize)).cloned();
+                        (base, nested.unwrap_or(context))
+                    }
+                    None => (primitive.clone(), context),
+                };
                 primitive = base.clone();
                 primitive.transform_subtree(&context);
                 Some((base, context))
