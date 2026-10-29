@@ -118,6 +118,13 @@ pub struct MetalRenderer {
     /// The last draw got no drawable, so nothing reached the screen; the window
     /// presents the scene again later (`take_dropped_frame`).
     dropped_frame: bool,
+    /// Kybern: presented drawables not yet shown, and the starvation episode
+    /// they caused (`drawable_gate.rs`).
+    presented: Arc<PresentedDrawables>,
+    presented_seq: u64,
+    starvation: Option<Starvation>,
+    slow_drawables_in_row: u32,
+    starvation_changed: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -367,6 +374,11 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             dropped_frame: false,
+            presented: Arc::default(),
+            presented_seq: 0,
+            starvation: None,
+            slow_drawables_in_row: 0,
+            starvation_changed: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -577,11 +589,19 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        if !self.may_request_drawable() {
+            // The compositor holds every drawable: skip instead of blocking the
+            // main thread in nextDrawable; the window presents the scene again.
+            self.dropped_frame = true;
+            return;
+        }
         if self.present_passive_regions(scene, viewport_size) { return; }
         self.clear_passive_region_layers();
         let drawable_started = std::time::Instant::now();
+        self.starve_fault_wait();
         let drawable = if drop_drawable_for_test() { None } else { layer.next_drawable() };
         let waited = drawable_started.elapsed();
+        self.drawable_waited(waited);
         if waited.as_millis() > 100 {
             SLOW_DRAWABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MAX_DRAWABLE_WAIT_US.fetch_max(waited.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -638,6 +658,7 @@ impl MetalRenderer {
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
+            self.track_presented(drawable);
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
@@ -2012,6 +2033,8 @@ include!("paint_region_cull.rs");
 include!("paint_region_atlas.rs");
 
 include!("gpu_clip.rs");
+
+include!("drawable_gate.rs");
 
 static GPU_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DROPPED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

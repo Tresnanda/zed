@@ -1915,18 +1915,21 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        // A drawable starvation began or ended (`drawable_gate.rs`): the host logs it.
+        let mut notify = this.renderer.take_starvation_changed();
         if this.renderer.take_dropped_frame() {
             let watch = &mut this.frame_watch;
             watch.dropped_in_a_row = watch.dropped_in_a_row.saturating_add(1);
             watch.dropped_frame_at.get_or_insert_with(Instant::now);
-            if watch.dropped_in_a_row == 1 {
-                // Lets the host log it (`getFrameWatchdog`), once per run of drops.
-                drop(this);
-                crate::notify_window_state();
-            }
+            // Lets the host log it (`getFrameWatchdog`), once per run of drops.
+            notify |= watch.dropped_in_a_row == 1;
         } else {
             this.frame_watch.dropped_in_a_row = 0;
             this.frame_watch.dropped_frame_at = None;
+        }
+        if notify {
+            drop(this);
+            crate::notify_window_state();
         }
     }
 
@@ -3706,6 +3709,14 @@ pub struct FrameWatchdogReport {
     pub max_drawable_wait_us: u64,
     /// The last stall, in words.
     pub last_stall: Option<String>,
+    /// Drawable starvation (`gpui_apple` `drawable_gate.rs`): episodes in which the
+    /// compositor held every drawable, the ones that ended, draws skipped instead of
+    /// blocking in nextDrawable, layer kicks, and the last episode in words.
+    pub drawable_starvations: u64,
+    pub drawable_recoveries: u64,
+    pub starved_skips: u64,
+    pub drawable_kicks: u64,
+    pub last_starvation: Option<String>,
 }
 
 static WATCHDOG_REPORT: std::sync::Mutex<FrameWatchdogReport> = std::sync::Mutex::new(FrameWatchdogReport {
@@ -3717,12 +3728,24 @@ static WATCHDOG_REPORT: std::sync::Mutex<FrameWatchdogReport> = std::sync::Mutex
     slow_drawables: 0,
     max_drawable_wait_us: 0,
     last_stall: None,
+    drawable_starvations: 0,
+    drawable_recoveries: 0,
+    starved_skips: 0,
+    drawable_kicks: 0,
+    last_starvation: None,
 });
 
 pub fn frame_watchdog_report() -> FrameWatchdogReport {
     let [dropped_frames, slow_drawables, max_drawable_wait_us] =
         gpui_apple::metal_renderer::drawable_stats();
+    let ([drawable_starvations, drawable_recoveries, starved_skips, drawable_kicks], last_starvation) =
+        gpui_apple::metal_renderer::starvation_stats();
     FrameWatchdogReport {
+        drawable_starvations,
+        drawable_recoveries,
+        starved_skips,
+        drawable_kicks,
+        last_starvation,
         frames: FRAMES.load(Ordering::Relaxed),
         represented_frames: REPRESENTED_FRAMES.load(Ordering::Relaxed),
         dropped_frames,
