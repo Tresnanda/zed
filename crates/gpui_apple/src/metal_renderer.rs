@@ -115,6 +115,9 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// The last draw got no drawable, so nothing reached the screen; the window
+    /// presents the scene again later (`take_dropped_frame`).
+    dropped_frame: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -363,6 +366,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            dropped_frame: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -411,6 +415,11 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// Whether the last draw reached no drawable, clearing the flag.
+    pub fn take_dropped_frame(&mut self) -> bool {
+        std::mem::take(&mut self.dropped_frame)
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -571,19 +580,27 @@ impl MetalRenderer {
         if self.present_passive_regions(scene, viewport_size) { return; }
         self.clear_passive_region_layers();
         let drawable_started = std::time::Instant::now();
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
+        let drawable = if drop_drawable_for_test() { None } else { layer.next_drawable() };
+        let waited = drawable_started.elapsed();
+        if waited.as_millis() > 100 {
+            SLOW_DRAWABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MAX_DRAWABLE_WAIT_US.fetch_max(waited.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var_os("KYBERN_DRAWABLE_TIMES").is_some() {
+                eprintln!("[frame-drawable] {:.3} ms transaction={}", waited.as_secs_f64()*1000.0, self.presents_with_transaction);
+            }
+        }
+        let Some(drawable) = drawable else {
+            // nextDrawable timed out (1 s): every drawable is still held by the
+            // compositor. The scene is already drawn, so the window would show
+            // the previous frame until something else invalidates it.
+            DROPPED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dropped_frame = true;
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
             return;
         };
-
-        if drawable_started.elapsed().as_millis() > 100 && std::env::var_os("KYBERN_DRAWABLE_TIMES").is_some() {
-            eprintln!("[frame-drawable] {:.3} ms transaction={}", drawable_started.elapsed().as_secs_f64()*1000.0, self.presents_with_transaction);
-        }
         let retained = match self.paint_region_target(scene,viewport_size) {
             Ok(value) => value,
             Err(error) => { log::error!("passive region setup: {error:#}"); self.paint_region_scissor=None; None },
@@ -1997,6 +2014,36 @@ include!("paint_region_atlas.rs");
 include!("gpu_clip.rs");
 
 static GPU_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DROPPED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SLOW_DRAWABLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAX_DRAWABLE_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `KYBERN_FRAME_STALL_TEST=drop-drawable:<ms>`: every <ms>, one draw behaves as
+/// if nextDrawable timed out, for `native/frame-stall-check.ts`.
+fn drop_drawable_for_test() -> bool {
+    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Some(every) = *EVERY.get_or_init(|| {
+        let value = std::env::var("KYBERN_FRAME_STALL_TEST").ok()?;
+        let ms = value.strip_prefix("drop-drawable:")?;
+        Some(std::time::Duration::from_millis(ms.parse().ok()?))
+    }) else {
+        return false;
+    };
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Process totals for the frame watchdog: draws that got no drawable, waits
+/// for one over 100 ms, and the longest wait in microseconds.
+pub fn drawable_stats() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [DROPPED_FRAMES.load(Relaxed), SLOW_DRAWABLES.load(Relaxed), MAX_DRAWABLE_WAIT_US.load(Relaxed)]
+}
 fn gpu_trace_enabled() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACE.get_or_init(|| std::env::var("KYBERN_GPU_TRACE").as_deref() == Ok("1"))

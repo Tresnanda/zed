@@ -297,6 +297,8 @@ impl MacPlatform {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
             pump_app_nonblocking();
+            // After the pump, so frame requests already queued have been served.
+            crate::window::check_frame_stalls();
             pool.drain();
         }
 

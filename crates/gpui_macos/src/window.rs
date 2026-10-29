@@ -59,7 +59,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
@@ -71,7 +71,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
@@ -635,6 +635,7 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    frame_watch: FrameWatch,
 }
 
 impl MacWindowState {
@@ -758,6 +759,7 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        self.frame_watch.armed_at = Some(Instant::now());
         unsafe {
             if !self
                 .native_window
@@ -779,6 +781,7 @@ impl MacWindowState {
     }
 
     fn stop_display_link(&mut self) {
+        self.frame_watch.armed_at = Some(Instant::now());
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
         }
@@ -1065,7 +1068,9 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                frame_watch: FrameWatch::default(),
             })));
+            watch_window_frames(&window.0);
 
             (*native_window).set_ivar(
                 WINDOW_STATE_IVAR,
@@ -1910,6 +1915,19 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+        if this.renderer.take_dropped_frame() {
+            let watch = &mut this.frame_watch;
+            watch.dropped_in_a_row = watch.dropped_in_a_row.saturating_add(1);
+            watch.dropped_frame_at.get_or_insert_with(Instant::now);
+            if watch.dropped_in_a_row == 1 {
+                // Lets the host log it (`getFrameWatchdog`), once per run of drops.
+                drop(this);
+                crate::notify_window_state();
+            }
+        } else {
+            this.frame_watch.dropped_in_a_row = 0;
+            this.frame_watch.dropped_frame_at = None;
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3009,11 +3027,32 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    let now = Instant::now();
+    lock.frame_watch.last_step = Some(now);
+    lock.frame_watch.repairs_in_a_row = 0;
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    let options = RequestFrameOptions {
+        // Present a scene whose draw got no drawable again, backing off while
+        // the compositor keeps every drawable.
+        require_presentation: watchdog_mode() == WatchdogMode::Repair
+            && lock
+                .frame_watch
+                .dropped_frame_at
+                .is_some_and(|at| now.duration_since(at) >= lock.frame_watch.dropped_frame_retry()),
+        force_render: false,
+    };
+    if options.require_presentation {
+        lock.frame_watch.dropped_frame_at = None;
+        REPRESENTED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
-        callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
+        callback(options);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        // A long draw is not a stall: count from when it ended.
+        lock.frame_watch.last_step = Some(Instant::now());
     }
 }
 
@@ -3596,4 +3635,324 @@ mod tests {
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
     }
+}
+
+// Frame watchdog (Kybern). A window draws only when its display's CVDisplayLink
+// calls `step`. AppKit re-subscribes it to the link on occlusion, screen and
+// key changes only, so a link that stops calling back (display sleep, display
+// reconfiguration), a subscription to a display the window has left, or a
+// window left unsubscribed (no screen while displays were reconfigured)
+// freezes the UI until the window is minimized, changes Space, moves to another
+// display or becomes key again; moving it on the same display does not help. The
+// embedded host pumps events at least every 100 ms whether or not frames
+// arrive, so `pump_events` checks every visible window here: no timer of its
+// own. `KYBERN_FRAME_WATCHDOG=0` turns it off, `=log` only reports.
+
+/// How long a visible window may go without a frame before it counts as stalled.
+const FRAME_STALL: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct FrameWatch {
+    /// The last display-link frame request (`step`).
+    last_step: Option<Instant>,
+    /// The last subscribe/unsubscribe; a stall is measured from the later of the two.
+    armed_at: Option<Instant>,
+    /// Watchdog repairs since the last frame; each doubles the wait before the next.
+    repairs_in_a_row: u32,
+    /// A draw that got no drawable and has not been presented since.
+    dropped_frame_at: Option<Instant>,
+    dropped_in_a_row: u32,
+}
+
+impl FrameWatch {
+    fn dropped_frame_retry(&self) -> Duration {
+        Duration::from_millis(100) * (1 << self.dropped_in_a_row.saturating_sub(1).min(4))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchdogMode {
+    Off,
+    Log,
+    Repair,
+}
+
+fn watchdog_mode() -> WatchdogMode {
+    static MODE: std::sync::OnceLock<WatchdogMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("KYBERN_FRAME_WATCHDOG").as_deref() {
+        Ok("0") => WatchdogMode::Off,
+        Ok("log") => WatchdogMode::Log,
+        _ => WatchdogMode::Repair,
+    })
+}
+
+static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPRESENTED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the frame watchdog has seen in this process.
+#[derive(Clone, Debug, Default)]
+pub struct FrameWatchdogReport {
+    /// Display-link frame requests served (`step`), all windows.
+    pub frames: u64,
+    /// Stalled visible windows found.
+    pub stalls: u64,
+    /// Stalls repaired (re-subscribed, link restarted or recreated).
+    pub repairs: u64,
+    /// Draws that got no drawable, waits for one over 100 ms, longest wait (µs).
+    pub dropped_frames: u64,
+    /// Scenes presented again after their draw got no drawable.
+    pub represented_frames: u64,
+    pub slow_drawables: u64,
+    pub max_drawable_wait_us: u64,
+    /// The last stall, in words.
+    pub last_stall: Option<String>,
+}
+
+static WATCHDOG_REPORT: std::sync::Mutex<FrameWatchdogReport> = std::sync::Mutex::new(FrameWatchdogReport {
+    frames: 0,
+    stalls: 0,
+    repairs: 0,
+    dropped_frames: 0,
+    represented_frames: 0,
+    slow_drawables: 0,
+    max_drawable_wait_us: 0,
+    last_stall: None,
+});
+
+pub fn frame_watchdog_report() -> FrameWatchdogReport {
+    let [dropped_frames, slow_drawables, max_drawable_wait_us] =
+        gpui_apple::metal_renderer::drawable_stats();
+    FrameWatchdogReport {
+        frames: FRAMES.load(Ordering::Relaxed),
+        represented_frames: REPRESENTED_FRAMES.load(Ordering::Relaxed),
+        dropped_frames,
+        slow_drawables,
+        max_drawable_wait_us,
+        ..WATCHDOG_REPORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+thread_local! {
+    static WATCHED_WINDOWS: RefCell<Vec<Weak<Mutex<MacWindowState>>>> = const { RefCell::new(Vec::new()) };
+    static LAST_WATCHDOG_CHECK: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+fn watch_window_frames(state: &Arc<Mutex<MacWindowState>>) {
+    static SCREEN_OBSERVERS: std::sync::Once = std::sync::Once::new();
+    SCREEN_OBSERVERS.call_once(|| unsafe {
+        // Displays rearranged, a mode or resolution changed, or the screens woke:
+        // re-subscribe every visible window to the display it is on now instead of
+        // waiting for the watchdog. The blocks live as long as the process.
+        let queue: id = msg_send![class!(NSOperationQueue), mainQueue];
+        let app_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: id = msg_send![workspace, notificationCenter];
+        for (center, name) in [
+            (app_center, "NSApplicationDidChangeScreenParametersNotification"),
+            (workspace_center, "NSWorkspaceScreensDidWakeNotification"),
+            (workspace_center, "NSWorkspaceDidWakeNotification"),
+        ] {
+            let block = ConcreteBlock::new(move |_: id| resubscribe_visible_windows(name)).copy();
+            let _: id = msg_send![center, addObserverForName: ns_string(name) object: nil queue: queue usingBlock: &*block];
+            mem::forget(block);
+        }
+    });
+    WATCHED_WINDOWS.with_borrow_mut(|windows| {
+        windows.retain(|window| window.strong_count() > 0);
+        windows.push(Arc::downgrade(state));
+    });
+}
+
+fn watched_windows() -> Vec<Arc<Mutex<MacWindowState>>> {
+    WATCHED_WINDOWS.with_borrow_mut(|windows| {
+        windows.retain(|window| window.strong_count() > 0);
+        windows.iter().filter_map(Weak::upgrade).collect()
+    })
+}
+
+fn window_is_visible(window: id) -> bool {
+    unsafe {
+        let miniaturized: BOOL = msg_send![window, isMiniaturized];
+        miniaturized == NO
+            && window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+    }
+}
+
+fn resubscribe_visible_windows(reason: &str) {
+    if watchdog_mode() != WatchdogMode::Repair {
+        return;
+    }
+    for state in watched_windows() {
+        let Some(mut lock) = state.try_lock() else {
+            continue;
+        };
+        if lock.closed.load(Ordering::Acquire) || !window_is_visible(lock.native_window) {
+            continue;
+        }
+        log::debug!("frame watchdog: {reason}: re-subscribing the window to its display");
+        lock.start_display_link();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FrameStall {
+    /// Visible, but subscribed to no display link.
+    Unsubscribed,
+    /// Subscribed to a display other than the one the window is on.
+    StaleDisplay(CGDirectDisplayID),
+    /// Subscribed to the right display, whose link has stopped calling back.
+    SilentLink(CGDirectDisplayID),
+}
+
+/// Called by the embedded host's `pump_events`; checks at most every 100 ms.
+pub(crate) fn check_frame_stalls() {
+    let mode = watchdog_mode();
+    if mode == WatchdogMode::Off {
+        return;
+    }
+    let now = Instant::now();
+    if LAST_WATCHDOG_CHECK.get().is_some_and(|at| now.duration_since(at) < Duration::from_millis(100)) {
+        return;
+    }
+    LAST_WATCHDOG_CHECK.set(Some(now));
+    for state in watched_windows() {
+        inject_stall_for_test(&state, now);
+        check_window_frames(&state, mode, now);
+    }
+}
+
+/// `KYBERN_FRAME_STALL_TEST=<fault>:<ms>` puts a visible window into one of the
+/// stalled states every <ms>, for the on-screen check (`native/frame-stall-check.ts`):
+/// `silent-link` stops its display's link behind the registry's back,
+/// `dead-link` makes that link ignore every later callback (only a new link helps),
+/// `unsubscribe` drops its subscription without an occlusion change.
+fn inject_stall_for_test(state: &Arc<Mutex<MacWindowState>>, now: Instant) {
+    static FAULT: std::sync::OnceLock<Option<(String, Duration)>> = std::sync::OnceLock::new();
+    let Some((fault, every)) = FAULT.get_or_init(|| {
+        let value = std::env::var("KYBERN_FRAME_STALL_TEST").ok()?;
+        let (fault, ms) = value.split_once(':')?;
+        Some((fault.to_string(), Duration::from_millis(ms.parse().ok()?)))
+    }) else {
+        return;
+    };
+    thread_local!(static LAST_FAULT: Cell<Option<Instant>> = const { Cell::new(None) });
+    let Some(last) = LAST_FAULT.get() else {
+        LAST_FAULT.set(Some(now));
+        return;
+    };
+    if now.duration_since(last) < *every {
+        return;
+    }
+    let Some(mut lock) = state.try_lock() else {
+        return;
+    };
+    if !window_is_visible(lock.native_window) {
+        return;
+    }
+    LAST_FAULT.set(Some(now));
+    match fault.as_str() {
+        "silent-link" => {
+            if let Some(display) = lock.frame_source.as_ref().and_then(WindowFrameSource::display_id) {
+                drop(lock);
+                crate::display_link::silence_link_for_test(display);
+                eprintln!("[frame-watchdog] test: silenced the link of display {display}");
+            }
+        }
+        "dead-link" => {
+            if let Some(display) = lock.frame_source.as_ref().and_then(WindowFrameSource::display_id) {
+                crate::display_link::kill_link_for_test(display);
+                eprintln!("[frame-watchdog] test: killed the link of display {display}");
+            }
+        }
+        "unsubscribe" => {
+            if let Some(source) = lock.frame_source.as_mut() {
+                source.stop();
+                eprintln!("[frame-watchdog] test: unsubscribed the window");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_window_frames(state: &Arc<Mutex<MacWindowState>>, mode: WatchdogMode, now: Instant) {
+    // Never wait: a window busy elsewhere on this thread is not stalled.
+    let Some(mut lock) = state.try_lock() else {
+        return;
+    };
+    if lock.closed.load(Ordering::Acquire)
+        || lock.request_frame_callback.is_none()
+        || !window_is_visible(lock.native_window)
+    {
+        return;
+    }
+    let watch = &lock.frame_watch;
+    let since = watch.last_step.max(watch.armed_at);
+    let quiet = since.map_or(Duration::MAX, |at| now.duration_since(at));
+    if quiet < FRAME_STALL * (1 << watch.repairs_in_a_row.min(4)) {
+        return;
+    }
+    let screen = display_id_for_screen(unsafe { lock.native_window.screen() });
+    let subscribed = lock.frame_source.as_ref().and_then(WindowFrameSource::display_id);
+    let stall = match (subscribed, screen) {
+        (None, _) => FrameStall::Unsubscribed,
+        (Some(display), Some(screen)) if display != screen => FrameStall::StaleDisplay(display),
+        (Some(display), _) => FrameStall::SilentLink(display),
+    };
+    let link = match stall {
+        FrameStall::StaleDisplay(display) | FrameStall::SilentLink(display) => {
+            crate::display_link::link_health(display)
+        }
+        FrameStall::Unsubscribed => None,
+    };
+    let ms = |duration: Option<Duration>| {
+        duration.map_or_else(|| "never".to_string(), |d| format!("{} ms ago", d.as_millis()))
+    };
+    let description = format!(
+        "{stall:?} on screen {}; last frame {}{}{}",
+        screen.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        ms(lock.frame_watch.last_step.map(|at| now.duration_since(at))),
+        link.map_or_else(String::new, |link| format!(
+            "; link running={} (CoreVideo {}), {} subscriber(s), {} callbacks, started {}, last callback {}",
+            link.running,
+            link.core_video_running,
+            link.subscribers,
+            link.callbacks,
+            ms(link.since_start),
+            ms(link.since_callback)
+        )),
+        if mode == WatchdogMode::Repair { "; repairing" } else { "" },
+    );
+    eprintln!("[frame-watchdog] {description}");
+    log::warn!("frame watchdog: {description}");
+    let repair = mode == WatchdogMode::Repair;
+    {
+        let mut report = WATCHDOG_REPORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        report.stalls += 1;
+        report.repairs += repair as u64;
+        report.last_stall = Some(description);
+    }
+    let attempt = lock.frame_watch.repairs_in_a_row;
+    lock.frame_watch.repairs_in_a_row = attempt.saturating_add(1);
+    lock.frame_watch.armed_at = Some(now);
+    if repair {
+        lock.stop_display_link();
+        if let FrameStall::SilentLink(display) = stall {
+            // First a restart; a link still silent after that is replaced. Past
+            // two replacements only re-subscribe, so a dead display leaks no more.
+            crate::display_link::restart_link(display, (1..=2).contains(&attempt)).log_err();
+        }
+        lock.start_display_link();
+    }
+    let view = lock.native_view.as_ptr() as *mut c_void;
+    drop(lock);
+    if repair {
+        // Serve the frame the window has been waiting for now; the link takes
+        // over from the next one. This frame is not the link recovering, so the
+        // repair count stays and a link still silent next time gets replaced.
+        step(view);
+        state.lock().frame_watch.repairs_in_a_row = attempt.saturating_add(1);
+    }
+    crate::notify_window_state();
 }

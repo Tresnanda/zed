@@ -32,9 +32,11 @@
 //! `CGDirectDisplayID` is reused forever, including after the display is
 //! unplugged and one reappears with the same id, or after mode/refresh-rate
 //! changes. `CVDisplayLink` looks up display timing dynamically, so a cached
-//! link keeps pacing correctly; if that ever proves untrue the fix is to
-//! also refresh entries from a display-reconfiguration callback, not to
-//! release links (which would reintroduce the teardown race).
+//! link keeps pacing correctly. A link can still stop calling back while the
+//! registry believes it runs (CoreVideo has been seen to do this on Apple
+//! silicon); the frame watchdog in `window.rs` notices a visible window without
+//! frames and calls `restart_link`, which replaces the link only by leaking
+//! the old one, never by releasing it (that would reintroduce the teardown race).
 //!
 //! Lock ordering: the output callback runs on the link's io thread and takes
 //! the registry lock, possibly while holding CVDisplayLink-internal locks. To
@@ -60,6 +62,7 @@ use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
@@ -84,6 +87,11 @@ struct DisplayEntry {
     link: sys::DisplayLink,
     running: bool,
     subscribers: Vec<(SubscriberId, DispatchRetained<DispatchSource>)>,
+    // For the frame watchdog (`window.rs`): when the link was last started
+    // and last called back, so a running link that has gone silent shows.
+    started_at: Option<Instant>,
+    last_callback: Option<Instant>,
+    callbacks: u64,
 }
 
 // SAFETY: Both fields wrapping raw pointers are refcounted handles to
@@ -127,7 +135,7 @@ fn debug_assert_main_thread() {
 }
 
 unsafe extern "C" fn display_link_output_callback(
-    _display_link_out: *mut sys::CVDisplayLink,
+    display_link_out: *mut sys::CVDisplayLink,
     _current_time: *const sys::CVTimeStamp,
     _output_time: *const sys::CVTimeStamp,
     _flags_in: i64,
@@ -135,11 +143,16 @@ unsafe extern "C" fn display_link_output_callback(
     display_id: *mut c_void,
 ) -> i32 {
     let display_id = display_id as usize as CGDirectDisplayID;
+    if DEAD_LINK_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) == display_link_out as usize {
+        return 0;
+    }
     let hook = {
-        let registry = lock_registry();
-        let Some(entry) = registry.displays.get(&display_id) else {
+        let mut registry = lock_registry();
+        let Some(entry) = registry.displays.get_mut(&display_id) else {
             return 0;
         };
+        entry.last_callback = Some(Instant::now());
+        entry.callbacks += 1;
         if entry.subscribers.is_empty() {
             return 0;
         }
@@ -188,6 +201,9 @@ fn subscribe(
                 link,
                 running: false,
                 subscribers: Vec::new(),
+                started_at: None,
+                last_callback: None,
+                callbacks: 0,
             }),
             (btree_map::Entry::Vacant(_), None) => {
                 // Entries are never removed, so an entry observed above cannot
@@ -200,6 +216,7 @@ fn subscribe(
             None
         } else {
             entry.running = true;
+            entry.started_at = Some(Instant::now());
             // Clone the refcounted handle so the CVDisplayLinkStart call can
             // happen after the lock is released.
             Some(entry.link.clone())
@@ -245,6 +262,113 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     }
 }
 
+/// What the frame watchdog needs to know about one display's link.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkHealth {
+    pub running: bool,
+    pub subscribers: usize,
+    pub callbacks: u64,
+    pub since_start: Option<Duration>,
+    pub since_callback: Option<Duration>,
+    /// What CoreVideo itself says (`CVDisplayLinkIsRunning`).
+    pub core_video_running: bool,
+}
+
+pub(crate) fn link_health(display_id: CGDirectDisplayID) -> Option<LinkHealth> {
+    let now = Instant::now();
+    let (mut link, health) = {
+        let registry = lock_registry();
+        let entry = registry.displays.get(&display_id)?;
+        let health = LinkHealth {
+            running: entry.running,
+            subscribers: entry.subscribers.len(),
+            callbacks: entry.callbacks,
+            since_start: entry.started_at.map(|at| now.duration_since(at)),
+            since_callback: entry.last_callback.map(|at| now.duration_since(at)),
+            core_video_running: false,
+        };
+        (entry.link.clone(), health)
+    };
+    // Outside the registry lock; see the lock ordering note above.
+    let core_video_running = unsafe { sys::CVDisplayLinkIsRunning(&mut link) != 0 };
+    Some(LinkHealth {
+        core_video_running,
+        ..health
+    })
+}
+
+/// Revive a display's link that the registry believes is running but that
+/// stopped calling back (seen after display sleep and reconfiguration).
+/// `recreate` replaces the link with a new one for the same display; the old
+/// one is stopped and leaked, like every link here, so a straggler callback
+/// still only reads the registry. Main thread only.
+pub(crate) fn restart_link(display_id: CGDirectDisplayID, recreate: bool) -> Result<()> {
+    debug_assert_main_thread();
+
+    let new_link = if recreate {
+        Some(unsafe {
+            sys::DisplayLink::new(
+                display_id,
+                display_link_output_callback,
+                display_id as usize as *mut c_void,
+            )?
+        })
+    } else {
+        None
+    };
+    let (mut old, start) = {
+        let mut registry = lock_registry();
+        let Some(entry) = registry.displays.get_mut(&display_id) else {
+            return Ok(());
+        };
+        let old = match new_link {
+            Some(link) => std::mem::replace(&mut entry.link, link),
+            None => entry.link.clone(),
+        };
+        let start = (!entry.subscribers.is_empty()).then(|| entry.link.clone());
+        entry.running = start.is_some();
+        entry.started_at = start.is_some().then(Instant::now);
+        entry.last_callback = None;
+        (old, start)
+    };
+    unsafe { old.stop().log_err() };
+    if recreate {
+        std::mem::forget(old);
+    }
+    if let Some(mut link) = start {
+        if let Err(error) = unsafe { link.start() } {
+            if let Some(entry) = lock_registry().displays.get_mut(&display_id) {
+                entry.running = false;
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+static DEAD_LINK_FOR_TEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Fault injection for `KYBERN_FRAME_STALL_TEST=dead-link`: from now on every
+/// callback of this display's current link is ignored, so only replacing the
+/// link (`restart_link(.., true)`) brings frames back.
+pub(crate) fn kill_link_for_test(display_id: CGDirectDisplayID) {
+    let link = lock_registry().displays.get(&display_id).map(|entry| foreign_types::ForeignType::as_ptr(&entry.link) as usize);
+    if let Some(link) = link {
+        DEAD_LINK_FOR_TEST.store(link, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fault injection for `KYBERN_FRAME_STALL_TEST` (window.rs): stop the link
+/// behind the registry's back, as CoreVideo does when a link silently stops
+/// calling back. The registry still says it runs. Main thread only.
+pub(crate) fn silence_link_for_test(display_id: CGDirectDisplayID) {
+    debug_assert_main_thread();
+    let link = lock_registry().displays.get(&display_id).map(|entry| entry.link.clone());
+    if let Some(mut link) = link {
+        unsafe { link.stop().log_err() };
+    }
+}
+
 /// A per-window source of frame requests, paced by the display the window is
 /// on. The wrapped dispatch source coalesces vsync ticks from the display's
 /// io thread and invokes `callback(data)` on the main queue.
@@ -286,6 +410,11 @@ impl WindowFrameSource {
         if let Some((display_id, subscriber_id)) = self.registration.take() {
             unsubscribe(display_id, subscriber_id);
         }
+    }
+
+    /// The display this source is subscribed to, if it is running.
+    pub fn display_id(&self) -> Option<CGDirectDisplayID> {
+        self.registration.map(|(display_id, _)| display_id)
     }
 }
 
@@ -425,6 +554,7 @@ mod sys {
         ) -> i32;
         pub fn CVDisplayLinkStart(display_link: &mut DisplayLinkRef) -> i32;
         pub fn CVDisplayLinkStop(display_link: &mut DisplayLinkRef) -> i32;
+        pub fn CVDisplayLinkIsRunning(display_link: &mut DisplayLinkRef) -> u8;
         pub fn CVDisplayLinkRelease(display_link: *mut CVDisplayLink);
         pub fn CVDisplayLinkRetain(display_link: *mut CVDisplayLink) -> *mut CVDisplayLink;
     }
@@ -473,7 +603,13 @@ mod sys {
         pub unsafe fn stop(&mut self) -> Result<()> {
             unsafe {
                 let code = CVDisplayLinkStop(self);
-                anyhow::ensure!(code == 0, "could not stop display link, code: {}", code);
+                // kCVReturnDisplayLinkNotRunning: a link CoreVideo already stopped
+                // (the frame watchdog restarts those) is stopped, not an error.
+                anyhow::ensure!(
+                    code == 0 || code == -6672,
+                    "could not stop display link, code: {}",
+                    code
+                );
                 Ok(())
             }
         }

@@ -59,6 +59,7 @@ pub use text_system::MacTextSystem;
 
 pub use display_link::set_frame_wake_hook;
 pub use platform::MacPlatform;
+pub use window::{FrameWatchdogReport, frame_watchdog_report};
 static WINDOW_STATE_OBSERVER: std::sync::RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = std::sync::RwLock::new(None);
 /// Install a nonblocking notification for window occlusion, key, move, screen,
 /// appearance and accessibility-display changes (embedded hosts re-read state).
