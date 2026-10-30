@@ -112,6 +112,8 @@ impl InstanceBufferPool {
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
+    drawable_acquisition: Option<DrawableAcquisition<AcquiredDrawable>>,
+    prepared_drawable: Option<metal::MetalDrawable>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -192,7 +194,8 @@ impl MetalRenderer {
             layer.set_framebuffer_only(false);
         }
         unsafe {
-            let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
+            let timeout = if async_drawables_enabled() { YES } else { NO };
+            let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: timeout];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
             let _: () = msg_send![
                 &*layer,
@@ -369,9 +372,13 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
+        let drawable_acquisition = (layer.is_some() && async_drawables_enabled())
+            .then(|| DrawableAcquisition::new().expect("start drawable acquisition worker"));
         Self {
             device,
             layer,
+            drawable_acquisition,
+            prepared_drawable: None,
             presents_with_transaction: false,
             dropped_frame: false,
             presented: Arc::default(),
@@ -541,6 +548,11 @@ impl MetalRenderer {
     }
 
     fn draw_with_frame_pool(&mut self, scene: &Scene) {
+        // Acquire before touching compositor sublayers: if no drawable is ready,
+        // keep both the old base frame and its promoted loops together.
+        if self.drawable_acquisition.is_some() && !self.prepare_drawable() {
+            return;
+        }
         // A changed compositor-loop set commits in the same CA transaction as this Metal frame, so a
         // leaf never shows twice or not at all while it moves between the scene and its sublayer.
         if !self.compositor_in_sync(scene) {
@@ -589,7 +601,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        if !self.may_request_drawable() {
+        if self.prepared_drawable.is_none() && !self.may_request_drawable() {
             // The compositor holds every drawable: skip instead of blocking the
             // main thread in nextDrawable; the window presents the scene again.
             self.dropped_frame = true;
@@ -597,23 +609,11 @@ impl MetalRenderer {
         }
         if self.present_passive_regions(scene, viewport_size) { return; }
         self.clear_passive_region_layers();
-        let drawable_started = std::time::Instant::now();
-        self.starve_fault_wait();
-        let drawable = if drop_drawable_for_test() { None } else { layer.next_drawable() };
-        let waited = drawable_started.elapsed();
-        self.drawable_waited(waited);
-        if waited.as_millis() > 100 {
-            SLOW_DRAWABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            MAX_DRAWABLE_WAIT_US.fetch_max(waited.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-            if std::env::var_os("KYBERN_DRAWABLE_TIMES").is_some() {
-                eprintln!("[frame-drawable] {:.3} ms transaction={}", waited.as_secs_f64()*1000.0, self.presents_with_transaction);
-            }
-        }
+        let drawable = self.prepared_drawable.take().or_else(|| self.next_drawable(&layer));
         let Some(drawable) = drawable else {
             // nextDrawable timed out (1 s): every drawable is still held by the
             // compositor. The scene is already drawn, so the window would show
             // the previous frame until something else invalidates it.
-            DROPPED_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.dropped_frame = true;
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
@@ -658,10 +658,11 @@ impl MetalRenderer {
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
-            self.track_presented(drawable);
-            command_buffer.present_drawable(drawable);
+            self.track_presented(&drawable);
+            command_buffer.present_drawable(&drawable);
             command_buffer.commit();
         }
+        self.prefetch_drawable(&layer);
     }
 
     fn render_frame(
@@ -2035,6 +2036,8 @@ include!("paint_region_atlas.rs");
 include!("gpu_clip.rs");
 
 include!("drawable_gate.rs");
+include!("drawable_acquisition.rs");
+include!("drawable_acquisition_renderer.rs");
 
 static GPU_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DROPPED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

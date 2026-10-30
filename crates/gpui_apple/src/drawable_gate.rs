@@ -159,8 +159,11 @@ impl MetalRenderer {
         if !drawable_gate_enabled() || self.layer.is_none() {
             return true;
         }
-        let wait = if self.starvation.is_some() { std::time::Duration::ZERO } else { STARVED_AFTER };
-        let blocked = self.presented.in_flight(wait) >= IN_FLIGHT_LIMIT;
+        let asynchronous = self.drawable_acquisition.is_some();
+        let wait = if asynchronous || self.starvation.is_some() { std::time::Duration::ZERO } else { STARVED_AFTER };
+        let full = self.presented.in_flight(wait) >= IN_FLIGHT_LIMIT;
+        let blocked = full && (!asynchronous || self.presented.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter().rev().nth(IN_FLIGHT_LIMIT - 1).is_some_and(|(_, at)| at.elapsed() >= STARVED_AFTER));
         let now = std::time::Instant::now();
         let shown = self.presented.shown_count.load(std::sync::atomic::Ordering::Acquire);
         match &self.starvation {
@@ -180,9 +183,7 @@ impl MetalRenderer {
 
     /// The emulated stalled compositor's `nextDrawable` wait (the real one is about 1 s).
     fn starve_fault_wait(&self) {
-        if STARVE_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && self.presented.in_flight(std::time::Duration::ZERO) >= IN_FLIGHT_LIMIT {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        wait_for_drawable_faults(&self.presented);
     }
 
     /// After `nextDrawable` returned: a slow one starts or prolongs an episode, a fast
@@ -290,5 +291,33 @@ impl MetalRenderer {
                 }
             }
         }
+    }
+}
+
+fn wait_for_drawable_faults(presented: &PresentedDrawables) {
+    slow_drawable_fault_wait();
+    if STARVE_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && presented.in_flight(std::time::Duration::ZERO) >= IN_FLIGHT_LIMIT {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+// Reproduce a slow acquisition while the gate's presented count is below its
+// limit. The field log records these waits with the gate enabled too.
+fn slow_drawable_fault_wait() {
+    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Some(every) = EVERY.get_or_init(|| {
+        let value = std::env::var("KYBERN_FRAME_STALL_TEST").ok()?;
+        Some(std::time::Duration::from_millis(value.strip_prefix("slow-drawable:")?.parse().ok()?))
+    }) else { return; };
+    let now = std::time::Instant::now();
+    let wait = {
+        let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = *last.get_or_insert(now);
+        if now.duration_since(previous) >= *every { *last = Some(now); true } else { false }
+    };
+    if wait {
+        eprintln!("[frame-drawable] test: nextDrawable waits with a non-full presented queue");
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }

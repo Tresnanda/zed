@@ -3037,11 +3037,10 @@ extern "C" fn step(view: *mut c_void) {
     let options = RequestFrameOptions {
         // Present a scene whose draw got no drawable again, backing off while
         // the compositor keeps every drawable.
-        require_presentation: watchdog_mode() == WatchdogMode::Repair
-            && lock
-                .frame_watch
-                .dropped_frame_at
-                .is_some_and(|at| now.duration_since(at) >= lock.frame_watch.dropped_frame_retry()),
+        require_presentation: lock.frame_watch.dropped_frame_at.is_some_and(|at|
+            lock.renderer.drawable_is_ready()
+                || (watchdog_mode() == WatchdogMode::Repair
+                    && now.duration_since(at) >= lock.frame_watch.dropped_frame_retry())),
         force_render: false,
     };
     if options.require_presentation {
