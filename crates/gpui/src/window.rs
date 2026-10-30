@@ -1679,19 +1679,26 @@ impl Window {
                 }
                 last_frame_time.set(Some(now));
 
-                let pending_next_frame_callbacks = next_frame_callbacks.take();
+                let mut pending_next_frame_callbacks = next_frame_callbacks.take();
                 #[cfg(not(target_os = "macos"))]
                 let ran_callbacks = !pending_next_frame_callbacks.is_empty();
                 #[cfg(not(target_os = "macos"))]
                 let mut drawn = false;
                 if !pending_next_frame_callbacks.is_empty() {
-                    handle
-                        .update(&mut cx, |_, window, cx| {
-                            for callback in pending_next_frame_callbacks {
-                                callback(window, cx);
-                            }
-                        })
-                        .log_err();
+                    if let Err(error) = handle.update(&mut cx, |_, window, cx| {
+                        for callback in pending_next_frame_callbacks.drain(..) {
+                            callback(window, cx);
+                        }
+                    }) {
+                        // A re-entrant request can find the app or window leased.
+                        // Keep its callbacks ahead of newly queued work for the next frame.
+                        log::warn!(
+                            "deferring next-frame callbacks after window update failed: {error:#}"
+                        );
+                        next_frame_callbacks
+                            .borrow_mut()
+                            .splice(0..0, pending_next_frame_callbacks);
+                    }
                 }
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
@@ -7749,6 +7756,36 @@ mod tests {
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn test_next_frame_callbacks_survive_a_leased_window(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let calls = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| {
+                let calls = calls.clone();
+                window.on_next_frame(move |_, _| calls.set(calls.get() + 1));
+                // The frame request cannot borrow the app until this update ends.
+                test_window.simulate_frame_request(RequestFrameOptions {
+                    require_presentation: true,
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 0);
+        for _ in 0..2 {
+            test_window.simulate_frame_request(RequestFrameOptions {
+                require_presentation: true,
+                ..Default::default()
+            });
+            assert_eq!(
+                calls.get(),
+                1,
+                "the deferred callback must run exactly once"
+            );
+        }
     }
 
     #[gpui::test]
