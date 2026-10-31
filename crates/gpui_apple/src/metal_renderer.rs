@@ -548,6 +548,7 @@ impl MetalRenderer {
     }
 
     fn draw_with_frame_pool(&mut self, scene: &Scene) {
+        self.kick_reentry_test();
         // Acquire before touching compositor sublayers: if no drawable is ready,
         // keep both the old base frame and its promoted loops together.
         if self.drawable_acquisition.is_some() && !self.prepare_drawable() {

@@ -294,6 +294,70 @@ impl MetalRenderer {
     }
 }
 
+/// `KYBERN_FRAME_STALL_TEST=kick-reentry:<ms>` (ADE-110): every <ms>, a draw invalidates
+/// its view's cursor rects and kicks the layer, as a starved draw does in the field.
+/// `flush-in-draw:<ms>` instead flushes the CA transaction right there, inside the
+/// draw, whatever the kick does: the AppKit callbacks a flush runs must not wait on
+/// the window lock the draw holds.
+fn kick_reentry_fault() -> Option<bool> {
+    static FAULT: std::sync::OnceLock<Option<(std::time::Duration, bool)>> = std::sync::OnceLock::new();
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let (every, flush) = (*FAULT.get_or_init(|| {
+        let value = std::env::var("KYBERN_FRAME_STALL_TEST").ok()?;
+        let (ms, flush) = match value.strip_prefix("kick-reentry:") {
+            Some(ms) => (ms, false),
+            None => (value.strip_prefix("flush-in-draw:")?, true),
+        };
+        Some((std::time::Duration::from_millis(ms.parse().ok()?), flush))
+    }))?;
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if now.duration_since(*last.get_or_insert(now)) < every {
+        return None;
+    }
+    *last = Some(now);
+    Some(flush)
+}
+
+impl MetalRenderer {
+    pub(crate) fn kick_reentry_test(&mut self) {
+        let Some(flush) = kick_reentry_fault() else { return; };
+        let Some(layer) = self.layer.as_ref() else { return; };
+        unsafe {
+            // AppKit makes a layer-backed view its backing layer's delegate.
+            let view: cocoa::base::id = msg_send![layer.as_ref(), delegate];
+            let window: cocoa::base::id = if view.is_null() { cocoa::base::nil } else { msg_send![view, window] };
+            if window.is_null() {
+                eprintln!("[frame-drawable] test: no view window to invalidate cursor rects in");
+            } else {
+                // AppKit updates cursor rects in a flush only for the key window, as the
+                // user's front window was in the field. The background test window says it
+                // is key instead of activating the app (its class has no `isKeyWindow`).
+                static KEY: std::sync::Once = std::sync::Once::new();
+                KEY.call_once(|| {
+                    extern "C" fn yes(_: &objc::runtime::Object, _: objc::runtime::Sel) -> objc::runtime::BOOL {
+                        objc::runtime::YES
+                    }
+                    let class = objc::runtime::object_getClass(window as *const objc::runtime::Object) as *mut objc::runtime::Class;
+                    let imp: objc::runtime::Imp = std::mem::transmute(yes as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel) -> objc::runtime::BOOL);
+                    objc::runtime::class_addMethod(class, sel!(isKeyWindow), imp, c"c@:".as_ptr());
+                });
+                let _: () = msg_send![window, invalidateCursorRectsForView: view];
+            }
+        }
+        if flush {
+            eprintln!("[frame-drawable] test: CA flush inside a draw with invalid cursor rects");
+            unsafe {
+                let _: () = msg_send![objc::class!(CATransaction), flush];
+            }
+        } else {
+            eprintln!("[frame-drawable] test: kick inside a draw with invalid cursor rects");
+            self.kick_drawables(std::time::Instant::now());
+        }
+        eprintln!("[frame-drawable] test: the draw continues");
+    }
+}
+
 fn wait_for_drawable_faults(presented: &PresentedDrawables) {
     slow_drawable_fault_wait();
     if STARVE_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && presented.in_flight(std::time::Duration::ZERO) >= IN_FLIGHT_LIMIT {
