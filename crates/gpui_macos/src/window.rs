@@ -75,6 +75,12 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+/// `WindowParams::app_owns_titlebar_drag`, kept on the view so it is read without the window
+/// lock. When true, the whole content view is reported as app-owned titlebar content via
+/// `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from the
+/// titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such windows draw
+/// their own titlebar and move the window via `start_window_move`.
+const APP_OWNS_TITLEBAR_DRAG_IVAR: &str = "appOwnsTitlebarDrag";
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -134,6 +140,7 @@ unsafe fn build_classes() {
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+            decl.add_ivar::<BOOL>(APP_OWNS_TITLEBAR_DRAG_IVAR);
             decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
 
             decl.add_method(
@@ -618,11 +625,6 @@ struct MacWindowState {
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
     first_mouse: bool,
-    // When true, the whole content view is reported as app-owned titlebar content via
-    // `_opaqueRectForWindowMoveWhenInTitlebar`, so AppKit does not drag the window from
-    // the titlebar or delay titlebar clicks (a delay first observed on macOS 27). Such
-    // windows draw their own titlebar and move the window via `start_window_move`.
-    app_owns_titlebar_drag: bool,
     fullscreen_restore_bounds: Bounds<Pixels>,
     simple_fullscreen_state: Option<SimpleFullscreenState>,
     move_tab_to_new_window_callback: Option<Box<dyn FnMut()>>,
@@ -1056,7 +1058,6 @@ impl MacWindow {
                 do_command_handled: None,
                 external_files_dragged: false,
                 first_mouse: false,
-                app_owns_titlebar_drag,
                 fullscreen_restore_bounds: Bounds::default(),
                 simple_fullscreen_state: None,
                 move_tab_to_new_window_callback: None,
@@ -1081,6 +1082,7 @@ impl MacWindow {
                 WINDOW_STATE_IVAR,
                 Arc::into_raw(window.0.clone()) as *const c_void,
             );
+            (*native_view).set_ivar(APP_OWNS_TITLEBAR_DRAG_IVAR, app_owns_titlebar_drag.to_objc());
 
             if let Some(title) = titlebar
                 .as_ref()
@@ -2288,6 +2290,45 @@ unsafe fn drop_window_state(object: &Object) {
     }
 }
 
+// Kybern (ADE-110): AppKit runs its display cycle (layout, display, cursor rects and
+// tracking areas, window-move regions) inside any Core Animation flush or commit, also
+// one made while this thread holds the window lock in a draw. 0.20.4 deadlocked on
+// itself there: a drawable kick flushed inside `MacWindow::draw` and `resetCursorRects`
+// waited on the lock. The callbacks such a cycle can run take the lock with `try_lock`
+// and, when it is held, do their work on a later turn of the main queue instead.
+
+/// The window lock for an AppKit callback, or `None` after scheduling `work` for the
+/// object (view or window, retained until then) on a later main-queue turn.
+fn lock_or_defer<'a>(
+    object: &Object,
+    window_state: &'a Arc<Mutex<MacWindowState>>,
+    callback: &'static str,
+    work: unsafe fn(&Object),
+) -> Option<parking_lot::MutexGuard<'a, MacWindowState>> {
+    if let Some(lock) = window_state.try_lock() {
+        return Some(lock);
+    }
+    struct Deferred {
+        object: id,
+        work: unsafe fn(&Object),
+    }
+    extern "C" fn run(context: *mut c_void) {
+        let deferred = unsafe { Box::from_raw(context as *mut Deferred) };
+        unsafe {
+            objc::rc::autoreleasepool(|| (deferred.work)(&*deferred.object));
+            let _: () = msg_send![deferred.object, release];
+        }
+    }
+    log::debug!("{callback} re-entered while the window is locked; deferred");
+    if std::env::var_os("KYBERN_FRAME_STALL_TEST").is_some() {
+        eprintln!("[frame-window] {callback} re-entered while the window is locked; deferred");
+    }
+    let object: id = unsafe { msg_send![object as *const Object as id, retain] };
+    let context = Box::into_raw(Box::new(Deferred { object, work })) as *mut c_void;
+    unsafe { DispatchQueue::main().exec_async_f(context, run) };
+    None
+}
+
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
 }
@@ -2306,6 +2347,9 @@ extern "C" fn dealloc_view(this: &Object, _: Sel) {
     }
 }
 
+/// A cursor-rect update was deferred and is still to be applied (test reports only).
+static CURSOR_RECTS_DEFERRED: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
     // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
     // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
@@ -2314,7 +2358,23 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
         let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
 
         let window_state = get_window_state(this);
-        let cursor_style = window_state.lock().cursor_style;
+        // Locked by a draw: no rect now, AppKit asks again on the next turn.
+        let Some(lock) = lock_or_defer(this, &window_state, "resetCursorRects", |view| {
+            let window: id = msg_send![view as *const Object as id, window];
+            if !window.is_null() {
+                CURSOR_RECTS_DEFERRED.store(true, Ordering::Relaxed);
+                let _: () = msg_send![window, invalidateCursorRectsForView: view as *const Object as id];
+            }
+        }) else {
+            return;
+        };
+        let cursor_style = lock.cursor_style;
+        drop(lock);
+        if CURSOR_RECTS_DEFERRED.swap(false, Ordering::Relaxed)
+            && std::env::var_os("KYBERN_FRAME_STALL_TEST").is_some()
+        {
+            eprintln!("[frame-window] resetCursorRects applied after a deferral");
+        }
 
         let cursor: id = match cursor_style {
             CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
@@ -2753,7 +2813,11 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    if let Some(mut lock) = lock_or_defer(this, &window_state, "windowDidResize", |window| {
+        unsafe { get_window_state(window) }.lock().move_traffic_light()
+    }) {
+        lock.move_traffic_light();
+    }
 }
 
 extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
@@ -2969,6 +3033,12 @@ extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
     let window_state = unsafe { get_window_state(this) };
+    let Some(lock) = lock_or_defer(this, &window_state, "viewDidChangeBackingProperties", |view| {
+        update_window_scale_factor(&unsafe { get_window_state(view) })
+    }) else {
+        return;
+    };
+    drop(lock);
     update_window_scale_factor(&window_state);
 }
 
@@ -2981,22 +3051,39 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     }
 
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-
     let new_size = convert(size);
     let old_size = unsafe {
         let old_frame: NSRect = msg_send![this, frame];
         convert(old_frame.size)
     };
-
     if old_size == new_size {
         return;
     }
+    // Locked by a draw: the view takes its size now, the renderer on the next turn.
+    let Some(lock) = lock_or_defer(this, &window_state, "setFrameSize", |view| {
+        let frame: NSRect = unsafe { msg_send![view as *const Object as id, frame] };
+        let window_state = unsafe { get_window_state(view) };
+        let lock = window_state.lock();
+        resize_renderer(&window_state, lock, convert(frame.size));
+    }) else {
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
+        }
+        return;
+    };
 
     unsafe {
         let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
     }
+    resize_renderer(&window_state, lock, new_size);
+}
 
+/// The renderer follows the view's new size, then the resize callback runs unlocked.
+fn resize_renderer(
+    window_state: &Arc<Mutex<MacWindowState>>,
+    mut lock: parking_lot::MutexGuard<'_, MacWindowState>,
+    new_size: Size<Pixels>,
+) {
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
     lock.renderer.update_drawable_size(drawable_size);
@@ -3012,7 +3099,12 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.lock();
+    // Locked by a draw: display again on the next turn.
+    let Some(mut lock) = lock_or_defer(this, &window_state, "displayLayer", |view| unsafe {
+        let _: () = msg_send![view as *const Object as id, setNeedsDisplay: YES];
+    }) else {
+        return;
+    };
     if let Some(mut callback) = lock.request_frame_callback.take() {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
@@ -3228,10 +3320,13 @@ extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
     crate::notify_window_state();
     unsafe {
         let state = get_window_state(this);
-        let appearance_changed_callback = {
-            let mut lock = state.as_ref().lock();
-            lock.appearance_changed_callback.take()
+        let Some(mut lock) = lock_or_defer(this, &state, "viewDidChangeEffectiveAppearance", |view| {
+            view_did_change_effective_appearance(view, sel!(viewDidChangeEffectiveAppearance))
+        }) else {
+            return;
         };
+        let appearance_changed_callback = lock.appearance_changed_callback.take();
+        drop(lock);
 
         if let Some(mut callback) = appearance_changed_callback {
             callback();
@@ -3261,9 +3356,10 @@ extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
 // enabled regardless.
 extern "C" fn opaque_rect_for_window_move_when_in_titlebar(this: &Object, _: Sel) -> NSRect {
     let zero_rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
-    let window_state = unsafe { get_window_state(this) };
-    let app_owns_titlebar_drag = window_state.as_ref().lock().app_owns_titlebar_drag;
-    if app_owns_titlebar_drag {
+    // Asked while AppKit updates window-move regions, also inside a draw: read the
+    // view's copy, never the window lock (ADE-110).
+    let app_owns_titlebar_drag: BOOL = unsafe { *this.get_ivar(APP_OWNS_TITLEBAR_DRAG_IVAR) };
+    if app_owns_titlebar_drag == YES {
         unsafe { msg_send![this, bounds] }
     } else {
         zero_rect

@@ -14,7 +14,8 @@
 // scene again later, `take_dropped_frame`) instead of blocking. A
 // `nextDrawable` slower than that twice in a row (or once with the pool full)
 // starts the same episode. While starved the layer is kicked: pending CA
-// transactions flushed, `presentsWithTransaction` off, `drawableSize` nudged for
+// transactions flushed (on the next main-queue turn, see `flush_transactions_later`),
+// `presentsWithTransaction` off, `drawableSize` nudged for
 // fresh surfaces, at 100 ms and backing off to 3.2 s; a draw is tried again as
 // soon as a handler shows the compositor moving, or after the same backoff.
 // Presents with a transaction are not counted: their handlers run on the main
@@ -263,8 +264,8 @@ impl MetalRenderer {
     }
 
     /// Whatever may make the compositor give drawables back: commit pending CA
-    /// transactions, stop presenting with them, and nudge `drawableSize` so the
-    /// next drawable is a fresh surface.
+    /// transactions (once this draw is over), stop presenting with them, and nudge
+    /// `drawableSize` so the next drawable is a fresh surface.
     fn kick_drawables(&mut self, now: std::time::Instant) {
         DRAWABLE_KICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(starvation) = self.starvation.as_mut() {
@@ -273,9 +274,7 @@ impl MetalRenderer {
             starvation.next_kick = now + starvation_backoff(starvation.kicks);
             starvation.retry_at = starvation.next_kick;
         }
-        unsafe {
-            let _: () = msg_send![objc::class!(CATransaction), flush];
-        }
+        flush_transactions_later();
         self.presents_with_transaction = false;
         if let Some(layer) = self.layer.as_ref() {
             let mode: bool = unsafe { msg_send![&**layer, presentsWithTransaction] };
@@ -355,6 +354,30 @@ impl MetalRenderer {
             self.kick_drawables(std::time::Instant::now());
         }
         eprintln!("[frame-drawable] test: the draw continues");
+    }
+}
+
+static FLUSH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "C" {
+    static _dispatch_main_q: c_void;
+    fn dispatch_async_f(queue: *const c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
+}
+
+/// Flushes pending CA transactions on a later turn of the main queue, one flush pending
+/// at most. A kick runs inside a draw, which holds the window lock; a flush there runs
+/// AppKit's display cycle, whose callbacks (`resetCursorRects` for the key window's
+/// invalid cursor rects) take that lock: the 0.20.4 main thread deadlocked on itself
+/// (ADE-110). The next turn runs outside every draw and window lock.
+fn flush_transactions_later() {
+    extern "C" fn flush(_: *mut c_void) {
+        FLUSH_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        objc::rc::autoreleasepool(|| unsafe {
+            let _: () = msg_send![objc::class!(CATransaction), flush];
+        });
+    }
+    if !FLUSH_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        unsafe { dispatch_async_f(&raw const _dispatch_main_q, ptr::null_mut(), flush) };
     }
 }
 
