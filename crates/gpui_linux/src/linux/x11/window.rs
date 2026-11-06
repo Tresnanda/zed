@@ -58,6 +58,7 @@ x11rb::atom_manager! {
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
         WM_TRANSIENT_FOR,
+        _KDE_NET_WM_BLUR_BEHIND_REGION,
         _NET_WM_PID,
         _NET_WM_NAME,
         _NET_WM_ICON,
@@ -290,7 +291,8 @@ pub struct X11WindowState {
 
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
-        self.background_appearance != WindowBackgroundAppearance::Opaque
+        self.client_side_decorations_supported && (self.decorations == WindowDecorations::Client
+            || self.background_appearance != WindowBackgroundAppearance::Opaque)
     }
 }
 
@@ -1042,6 +1044,21 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    fn update_blur(&self) {
+        let state = self.state.borrow();
+        let atom = state.atoms._KDE_NET_WM_BLUR_BEHIND_REGION;
+        if state.client_side_decorations_supported && state.background_appearance == WindowBackgroundAppearance::Blurred {
+            let radius = if state.decorations == WindowDecorations::Client && !state.fullscreen && !state.maximized_vertical && !state.maximized_horizontal && !state.edge_constraints.as_ref().is_some_and(|edges| { let tiling = edges.to_tiling(); tiling.top || tiling.bottom || tiling.left || tiling.right }) { (12.0 * state.scale_factor).round() as i32 } else { 0 };
+            let width = (f32::from(state.bounds.size.width) * state.scale_factor).round() as i32;
+            let height = (f32::from(state.bounds.size.height) * state.scale_factor).round() as i32;
+            let region: Vec<u32> = crate::desktop_material::rounded_region(width, height, radius).into_iter().flatten().map(|v| v as u32).collect();
+            check_reply(|| "X11 blur region failed.", self.xcb.change_property32(xproto::PropMode::REPLACE, self.x_window, atom, xproto::AtomEnum::CARDINAL, &region)).log_err();
+        } else {
+            check_reply(|| "X11 clear blur failed.", self.xcb.delete_property(self.x_window, atom)).log_err();
+        }
+        self.xcb.flush().log_err();
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1307,6 +1324,7 @@ impl X11WindowStatePtr {
             result
         };
 
+        self.update_blur();
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(ref mut fun) = callbacks.resize {
             fun(content_size, scale_factor)
@@ -1597,9 +1615,11 @@ impl PlatformWindow for X11Window {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.0.state.borrow_mut();
-        state.background_appearance = background_appearance;
+        state.background_appearance = if state.client_side_decorations_supported { background_appearance } else { WindowBackgroundAppearance::Opaque };
         let transparent = state.is_transparent();
         state.renderer.update_transparency(transparent);
+        drop(state);
+        self.0.update_blur();
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -1928,6 +1948,7 @@ impl PlatformWindow for X11Window {
         }
 
         drop(state);
+        self.0.update_blur();
         let mut callbacks = self.0.callbacks.borrow_mut();
         if let Some(appearance_changed) = callbacks.appearance_changed.as_mut() {
             appearance_changed();

@@ -1,3 +1,4 @@
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     ffi::c_void,
@@ -103,6 +104,7 @@ pub struct WaylandWindowState {
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
+    background_effect: Option<ExtBackgroundEffectSurfaceV1>,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
@@ -600,6 +602,7 @@ impl WaylandWindowState {
             children: FxHashMap::default(),
             surface,
             app_id: options.app_id,
+            background_effect: None,
             blur: None,
             viewport,
             globals,
@@ -763,6 +766,8 @@ impl Drop for WaylandWindow {
         let client = state.client.clone();
 
         state.renderer.destroy();
+
+        if let Some(effect) = &state.background_effect { effect.destroy(); }
 
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
@@ -1023,6 +1028,11 @@ impl WaylandWindowStatePtr {
             // presented buffer guarantees a compositor frame callback.
             _ => {}
         }
+    }
+
+    pub(crate) fn refresh_material(&self) {
+        update_window(self.state.borrow_mut());
+        self.request_redraw();
     }
 
     fn request_redraw(&self) {
@@ -2224,13 +2234,31 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
+    let blur_region = state.globals.compositor.create_region(&state.globals.qh, ());
+    let radius = if state.decorations == WindowDecorations::Client && !state.fullscreen && !state.maximized
+        && !state.tiling.top && !state.tiling.bottom && !state.tiling.left && !state.tiling.right { 12 } else { 0 };
+    for [x, y, width, height] in crate::desktop_material::rounded_region(opaque_area.size.width, opaque_area.size.height, radius) {
+        blur_region.add(opaque_area.origin.x + x, opaque_area.origin.y + y, width, height);
+    }
+    let standard_blur = state.globals.background_effect_blur.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(manager) = &state.globals.background_effect_manager {
+        if state.background_effect.is_none() {
+            state.background_effect = Some(manager.get_background_effect(&state.surface, &state.globals.qh, ()));
+        }
+        if let Some(effect) = &state.background_effect {
+            effect.set_blur_region((standard_blur && state.background_appearance == WindowBackgroundAppearance::Blurred).then_some(&blur_region));
+        }
+    }
     if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        if state.background_appearance == WindowBackgroundAppearance::Blurred && !standard_blur {
             if state.blur.is_none() {
                 let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
             }
-            state.blur.as_ref().unwrap().commit();
+            if let Some(blur) = &state.blur {
+                blur.set_region(Some(&blur_region));
+                blur.commit();
+            }
         } else {
             // It probably doesn't hurt to clear the blur for opaque windows
             blur_manager.unset(&state.surface);
@@ -2240,6 +2268,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         }
     }
 
+    blur_region.destroy();
     region.destroy();
 }
 

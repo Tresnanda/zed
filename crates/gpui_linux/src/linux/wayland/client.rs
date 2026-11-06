@@ -1,3 +1,4 @@
+use wayland_protocols::ext::background_effect::v1::client::{ext_background_effect_manager_v1, ext_background_effect_surface_v1};
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -220,6 +221,8 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub background_effect_blur: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub background_effect_manager: Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
@@ -237,6 +240,7 @@ impl Globals {
         frame_ping: Ping,
     ) -> anyhow::Result<Self> {
         let dialog_v = XdgWmDialogV1::interface().version;
+        let background_effect_blur = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Globals {
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
@@ -268,6 +272,8 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
+            background_effect_manager: globals.bind(&qh, 1..=1, background_effect_blur.clone()).ok(),
+            background_effect_blur,
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
@@ -3070,3 +3076,15 @@ mod tests {
         );
     }
 }
+
+impl Dispatch<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, std::sync::Arc<std::sync::atomic::AtomicBool>> for WaylandClientStatePtr {
+    fn event(state: &mut Self, _: &ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1, event: ext_background_effect_manager_v1::Event, supported: &std::sync::Arc<std::sync::atomic::AtomicBool>, _: &Connection, _: &QueueHandle<Self>) {
+        if let ext_background_effect_manager_v1::Event::Capabilities { flags } = event {
+            let enabled = matches!(flags, WEnum::Value(flags) if flags.contains(ext_background_effect_manager_v1::Capability::Blur));
+            supported.store(enabled, std::sync::atomic::Ordering::Relaxed);
+            let windows: Vec<_> = state.get_client().borrow().windows.values().cloned().collect();
+            for window in windows { window.refresh_material(); }
+        }
+    }
+}
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
