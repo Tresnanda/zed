@@ -90,10 +90,7 @@ fn wayland() -> anyhow::Result<(bool, bool)> {
 
 #[cfg(feature = "x11")]
 fn x11() -> anyhow::Result<(bool, bool)> {
-    use x11rb::{
-        connection::Connection,
-        protocol::xproto::{AtomEnum, ConnectionExt},
-    };
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
     let (connection, screen) = x11rb::connect(None)?;
     let root = connection.setup().roots[screen].root;
     let selection = connection
@@ -107,22 +104,13 @@ fn x11() -> anyhow::Result<(bool, bool)> {
         .intern_atom(true, b"_KDE_NET_WM_BLUR_BEHIND_REGION")?
         .reply()?
         .atom;
-    let supported = connection
-        .intern_atom(true, b"_NET_SUPPORTED")?
-        .reply()?
-        .atom;
-    if blur == 0 || supported == 0 {
+    if blur == 0 {
         return Ok((true, false));
     }
-    let reply = connection
-        .get_property(false, root, supported, AtomEnum::ATOM, 0, 4096)?
-        .reply()?;
-    Ok((
-        true,
-        reply
-            .value32()
-            .is_some_and(|mut atoms| atoms.any(|atom| atom == blur)),
-    ))
+    // KWin advertises effects as root-window properties, not EWMH _NET_SUPPORTED.
+    // This matches KWindowEffectsPrivateX11::isEffectAvailable.
+    let properties = connection.list_properties(root)?.reply()?.atoms;
+    Ok((true, properties.contains(&blur)))
 }
 
 // Match the addon's 12 logical-pixel CSD clip. Interior rows form one rectangle;
