@@ -15,7 +15,7 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ScrollDelta, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -1228,7 +1228,12 @@ pub struct Window {
     pointer_outside: bool,
     modifiers: Modifiers,
     capslock: Capslock,
+    /// The rendering scale: the display's scale factor times `ui_zoom`.
     scale_factor: f32,
+    /// Kybern: the window's interface zoom (1.0 = actual size). Element coordinates are in
+    /// content pixels, the platform's in OS points; one OS point is `ui_zoom` content pixels
+    /// smaller. See [`Window::set_ui_zoom`].
+    ui_zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1830,7 +1835,10 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        let event = window.platform_input_to_content(event);
+                        window.dispatch_event(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -1848,7 +1856,7 @@ impl Window {
                     // new as the last mouse event GPUI dispatched, and Windows asks before it sends
                     // the move or press that would update it. The topmost area wins, so a control
                     // (`Client`) inside a drag area is not part of the caption.
-                    let hit = window.rendered_frame.hit_test(window.platform_window.hit_test_position());
+                    let hit = window.rendered_frame.hit_test(window.platform_to_content_point(window.platform_window.hit_test_position()));
                     let areas = &window.rendered_frame.window_control_hitboxes;
                     for id in &hit.ids {
                         if let Some((area, _)) = areas.iter().find(|(_, hitbox)| hitbox.id == *id) {
@@ -1974,6 +1982,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            ui_zoom: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2357,6 +2366,11 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        if self.ui_zoom != 1.0 {
+            let zoomed: Option<Vec<Bounds<Pixels>>> = region.map(|rects| rects.iter().map(|rect| self.content_to_platform_bounds(*rect)).collect());
+            self.platform_window.set_input_region(zoomed.as_deref());
+            return;
+        }
         self.platform_window.set_input_region(region);
     }
 
@@ -2622,10 +2636,8 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.sync_platform_geometry();
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
 
@@ -2678,6 +2690,20 @@ impl Window {
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
+    }
+
+    /// Kybern: changes the window's minimum content size (OS points, independent of the
+    /// interface zoom) and grows a smaller windowed window to it.
+    pub fn set_window_min_size(&mut self, min: Option<Size<Pixels>>) {
+        self.platform_window.set_min_size(min);
+        let Some(min) = min else { return };
+        if self.platform_window.is_fullscreen() || matches!(self.platform_window.window_bounds(), WindowBounds::Maximized(_) | WindowBounds::Fullscreen(_)) {
+            return;
+        }
+        let content = self.platform_window.content_size();
+        if content.width < min.width || content.height < min.height {
+            self.platform_window.resize(size(content.width.max(min.width), content.height.max(min.height)));
+        }
     }
 
     /// Returns whether or not the window is currently fullscreen
@@ -2743,7 +2769,7 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window.show_window_menu(self.content_to_platform_point(position))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2757,7 +2783,7 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.ui_zoom);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2842,8 +2868,104 @@ impl Window {
     /// Overrides the display scale factor for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
-        self.scale_factor = scale_factor;
+        self.scale_factor = scale_factor * self.ui_zoom;
         self.refresh();
+    }
+
+    /// Kybern: the window's interface zoom, 1.0 at actual size (see [`Window::set_ui_zoom`]).
+    pub fn ui_zoom(&self) -> f32 {
+        self.ui_zoom
+    }
+
+    /// Kybern: the display's own scale factor, without the interface zoom.
+    pub fn platform_scale_factor(&self) -> f32 {
+        self.platform_window.scale_factor()
+    }
+
+    /// Kybern: zooms the whole interface of this window, like a browser's page zoom. Everything
+    /// is laid out in a viewport of the window's content size divided by `zoom` and rendered at
+    /// the display scale times `zoom`, so text, images and vector paths rasterize at the new
+    /// device resolution instead of being stretched. Input from the platform is divided by
+    /// `zoom` before it is dispatched, and what goes back to the platform (IME candidate
+    /// bounds, the window menu, input regions, client insets) is multiplied by it. Window
+    /// bounds, sizes and minimum sizes stay in OS points. Every cached view re-renders on the
+    /// next frame (`refresh`), and bounds observers run as for a resize.
+    pub fn set_ui_zoom(&mut self, zoom: f32, cx: &mut App) {
+        let zoom = if zoom.is_finite() { zoom.clamp(0.25, 4.0) } else { 1.0 };
+        if (zoom - self.ui_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.ui_zoom = zoom;
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * zoom);
+        }
+        self.bounds_changed(cx);
+    }
+
+    /// Kybern: the scale factor, viewport and pointer from the platform, through the zoom.
+    fn sync_platform_geometry(&mut self) {
+        let zoom = self.ui_zoom;
+        self.scale_factor = self.platform_window.scale_factor() * zoom;
+        let content = self.platform_window.content_size();
+        self.viewport_size = size(content.width / zoom, content.height / zoom);
+        self.mouse_position = self.platform_to_content_point(self.platform_window.mouse_position());
+    }
+
+    /// Kybern: a window-relative point from the platform (OS points) in content pixels.
+    pub fn platform_to_content_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        if self.ui_zoom == 1.0 {
+            return point;
+        }
+        crate::point(point.x / self.ui_zoom, point.y / self.ui_zoom)
+    }
+
+    /// Kybern: a window-relative point in content pixels in OS points.
+    pub fn content_to_platform_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        crate::point(point.x * self.ui_zoom, point.y * self.ui_zoom)
+    }
+
+    /// Kybern: window-relative bounds in content pixels in OS points.
+    pub fn content_to_platform_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.content_to_platform_point(bounds.origin),
+            size: size(bounds.size.width * self.ui_zoom, bounds.size.height * self.ui_zoom),
+        }
+    }
+
+    /// Kybern: an input event from the platform, in OS points, in content pixels.
+    pub(crate) fn platform_input_to_content(&self, event: PlatformInput) -> PlatformInput {
+        let zoom = self.ui_zoom;
+        if zoom == 1.0 {
+            return event;
+        }
+        let at = |point: Point<Pixels>| crate::point(point.x / zoom, point.y / zoom);
+        match event {
+            PlatformInput::MouseDown(mut e) => { e.position = at(e.position); PlatformInput::MouseDown(e) }
+            PlatformInput::MouseUp(mut e) => { e.position = at(e.position); PlatformInput::MouseUp(e) }
+            PlatformInput::MouseMove(mut e) => { e.position = at(e.position); PlatformInput::MouseMove(e) }
+            PlatformInput::MousePressure(mut e) => { e.position = at(e.position); PlatformInput::MousePressure(e) }
+            PlatformInput::MouseExited(mut e) => { e.position = at(e.position); PlatformInput::MouseExited(e) }
+            PlatformInput::ScrollWheel(mut e) => {
+                e.position = at(e.position);
+                // A trackpad's pixel delta follows the finger on screen; line deltas are content lines.
+                if let ScrollDelta::Pixels(delta) = e.delta {
+                    e.delta = ScrollDelta::Pixels(at(delta));
+                }
+                PlatformInput::ScrollWheel(e)
+            }
+            PlatformInput::Pinch(mut e) => { e.position = at(e.position); PlatformInput::Pinch(e) }
+            PlatformInput::Touch(mut e) => { e.position = at(e.position); PlatformInput::Touch(e) }
+            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }) => {
+                PlatformInput::FileDrop(FileDropEvent::Entered { position: at(position), paths })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Pending { position: at(position) })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Submit { position: at(position) })
+            }
+            other => other,
+        }
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -6386,7 +6508,7 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
-                    window.platform_window.update_ime_position(bounds);
+                    window.platform_window.update_ime_position(window.content_to_platform_bounds(bounds));
                 }
                 window.platform_window.set_input_handler(input_handler);
             }

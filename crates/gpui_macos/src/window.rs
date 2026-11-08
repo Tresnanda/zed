@@ -1660,6 +1660,17 @@ impl PlatformWindow for MacWindow {
 
     fn set_app_id(&mut self, _app_id: &str) {}
 
+    fn set_min_size(&self, size: Option<Size<Pixels>>) {
+        let native_window = self.0.lock().native_window;
+        let size = size.unwrap_or_else(|| gpui::size(gpui::px(1.), gpui::px(1.)));
+        unsafe {
+            native_window.setContentMinSize_(NSSize {
+                width: size.width.to_f64(),
+                height: size.height.to_f64(),
+            });
+        }
+    }
+
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
         this.background_appearance = background_appearance;

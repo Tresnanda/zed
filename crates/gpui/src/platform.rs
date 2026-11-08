@@ -1031,6 +1031,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         WindowControls::default()
     }
     fn set_client_inset(&self, _inset: Pixels) {}
+
+    /// Kybern: changes the window's minimum content size, in OS points; `None` removes it.
+    /// It does not resize the window (see `Window::set_window_min_size`).
+    fn set_min_size(&self, _size: Option<Size<Pixels>>) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
     /// Kybern: whether this window's renderer draws the scene backdrop filter (`Scene::backdrops`). Where it does not,
     /// a filter draws nothing and only the fill painted above it shows.
@@ -1674,8 +1678,13 @@ impl PlatformInputHandler {
     }
 
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
+        // Kybern: the platform places the IME candidate window in OS points.
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| window.content_to_platform_bounds(bounds))
+            })
             .ok()
             .flatten()
     }
@@ -1743,7 +1752,10 @@ impl PlatformInputHandler {
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                let point = window.platform_to_content_point(point);
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }

@@ -1558,6 +1558,23 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().hovered
     }
 
+    fn set_min_size(&self, size: Option<Size<Pixels>>) {
+        let state = self.0.state.borrow();
+        let max_texture_size = state.renderer.max_texture_size();
+        let mut size_hints = WmSizeHints::new();
+        size_hints.min_size = size.map(|size| {
+            let size = size.to_device_pixels(state.scale_factor);
+            (size.width.0, size.height.0)
+        });
+        size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+        check_reply(
+            || "X11 change of WM_SIZE_HINTS failed.",
+            size_hints.set_normal_hints(&self.0.xcb, self.0.x_window),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
+    }
+
     fn set_title(&mut self, title: &str) {
         check_reply(
             || "X11 ChangeProperty8 on WM_NAME failed.",

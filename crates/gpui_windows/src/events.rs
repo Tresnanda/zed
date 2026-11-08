@@ -255,7 +255,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_get_min_max_info_msg(&self, lparam: LPARAM) -> Option<isize> {
-        let min_size = self.state.min_size?;
+        let min_size = self.state.min_size.get()?;
         let scale_factor = self.state.scale_factor.get();
         let boarder_offset = &self.state.border_offset;
 

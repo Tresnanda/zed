@@ -1803,6 +1803,15 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn set_min_size(&self, size: Option<Size<Pixels>>) {
+        let state = self.borrow();
+        if let Some(toplevel) = state.surface_state.toplevel() {
+            let (width, height) = size.map_or((0, 0), |size| (f32::from(size.width) as i32, f32::from(size.height) as i32));
+            toplevel.set_min_size(width, height);
+            state.surface.commit();
+        }
+    }
+
     fn set_app_id(&mut self, app_id: &str) {
         let mut state = self.borrow_mut();
         if let Some(toplevel) = state.surface_state.toplevel() {
