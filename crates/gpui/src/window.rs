@@ -1204,6 +1204,7 @@ pub struct Window {
     rounded_clip_pool: RoundedClipPool,
     subtree_transform: SubtreeTransformState,
     scroll_input: ScrollInput,
+    scroll_latch: ScrollLatch,
     subtree_tags: Vec<(u64, Point<Pixels>)>,
     subtree_a11y: std::collections::HashMap<accesskit::NodeId,SubtreeGeometry>,
     subtree_masks: Vec<SubtreeMask>,
@@ -1960,6 +1961,7 @@ impl Window {
             rounded_clip_pool: Default::default(),
             subtree_transform: Default::default(),
             scroll_input: Default::default(),
+            scroll_latch: Default::default(),
             subtree_tags: Vec::new(),
             subtree_a11y: Default::default(),
             subtree_masks: Vec::new(),
@@ -5942,6 +5944,10 @@ impl Window {
             return;
         }
 
+        let wheel = event.downcast_ref::<crate::ScrollWheelEvent>();
+        if let Some(wheel) = wheel {
+            self.scroll_latch_begin(wheel);
+        }
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
@@ -5966,6 +5972,9 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+        if wheel.is_some() {
+            self.scroll_latch_end();
+        }
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
@@ -8499,6 +8508,8 @@ include!("rounded_clip.rs");
 include!("subtree_geometry.rs");
 
 include!("scroll_input.rs");
+
+include!("scroll_latch.rs");
 
 include!("subtree_transform_window.rs");
 

@@ -1040,6 +1040,19 @@ impl StateInner {
         cx.notify(current_view);
     }
 
+    /// Whether a wheel delta (positive: toward the start) would move the list, for wheel latching.
+    fn can_scroll_by(&self, height: Pixels, delta_y: Pixels) -> bool {
+        if self.reset {
+            return false;
+        }
+        let padding = self.last_padding.unwrap_or_default();
+        let scroll_max =
+            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        let top = self.scroll_top(&self.logical_scroll_top()).min(scroll_max);
+        // Half a pixel of slack: measured heights leave the top a hair short of its ends.
+        (delta_y > px(0.) && top > px(0.5)) || (delta_y < px(0.) && top < scroll_max - px(0.5))
+    }
+
     fn logical_scroll_top(&self) -> ListOffset {
         self.logical_scroll_top
             .unwrap_or_else(|| match self.alignment {
@@ -1721,9 +1734,16 @@ impl Element for List {
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
+        // Kybern: wheel latching (`window/scroll_latch.rs`), keyed by the list's shared state.
+        let latch_key = Rc::as_ptr(&list_state.0) as *const () as usize;
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                if event.delta.pixel_delta(px(20.)).y == px(0.) { return; }
+            if phase == DispatchPhase::Bubble
+                && (hitbox_id.should_handle_scroll(window) || window.scroll_latched_to(latch_key))
+            {
+                let delta_y = event.delta.pixel_delta(px(20.)).y;
+                if delta_y == px(0.) { return; }
+                let can_scroll = list_state.0.borrow().can_scroll_by(height, delta_y);
+                if !window.latch_scroll(latch_key, point(px(0.), delta_y), can_scroll) { return; }
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(

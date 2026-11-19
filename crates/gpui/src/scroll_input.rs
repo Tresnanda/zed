@@ -7,6 +7,9 @@ struct ScrollInputBatch {
     last: std::time::Instant,
     packets: usize,
     started: bool,
+    /// A real contact (`Started`) is in this batch. `started` alone may come from momentum after a lift, which continues
+    /// the same gesture for wheel latching (`scroll_latch.rs`).
+    contact: bool,
     terminal: Option<crate::TouchPhase>,
 }
 #[derive(Default)]
@@ -51,6 +54,7 @@ impl Window {
             old.packets += 1;
             // A later contact/momentum packet supersedes an earlier terminal
             // marker in this display batch, while retaining its axis reset.
+            if event.touch_phase == crate::TouchPhase::Started { old.contact = true; }
             if event.touch_phase == crate::TouchPhase::Started || (old.terminal.is_some() && event.touch_phase == crate::TouchPhase::Moved) {
                 old.started = true;
                 old.terminal = None;
@@ -60,6 +64,7 @@ impl Window {
             self.scroll_input.pending = Some(ScrollInputBatch {
                 event: event.clone(), target, first: now, last: now, packets: 1,
                 started: event.touch_phase == crate::TouchPhase::Started,
+                contact: event.touch_phase == crate::TouchPhase::Started,
                 terminal: matches!(event.touch_phase, crate::TouchPhase::Ended | crate::TouchPhase::Cancelled).then_some(event.touch_phase),
             });
         }
@@ -83,6 +88,7 @@ impl Window {
         if batch.started {
             let mut phase=event.clone();phase.touch_phase=crate::TouchPhase::Started;
             phase.delta=crate::ScrollDelta::Pixels(point(px(0.),px(0.)));
+            if !batch.contact {self.scroll_latch.continue_gesture();}
             self.dispatch_event(PlatformInput::ScrollWheel(phase),cx);
         }
         // Carry the terminal phase on the merged delta. A separate zero end
